@@ -7,8 +7,16 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const repositoryName = process.env.GITHUB_REPOSITORY?.split("/")[1];
+const defaultBase =
+  repositoryName && !repositoryName.toLowerCase().endsWith(".github.io")
+    ? `/${repositoryName}/`
+    : "/";
+
 export default defineConfig({
-  base: "/",
+  // Override with VITE_BASE_PATH when targeting a root Pages site such as
+  // https://<owner>.github.io from a non-<owner>.github.io repository.
+  base: process.env.VITE_BASE_PATH ?? defaultBase,
   plugins: [react()],
   server: {
     // Proxy API calls to the FastAPI backend at port 8000
