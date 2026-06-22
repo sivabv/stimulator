@@ -7,7 +7,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-const repositoryName = process.env.GITHUB_REPOSITORY?.split("/")[1];
+const githubRepository = process.env.GITHUB_REPOSITORY;
+const repositoryName = githubRepository ? githubRepository.split("/")[1] : undefined;
 const defaultBase =
   repositoryName && !repositoryName.toLowerCase().endsWith(".github.io")
     ? `/${repositoryName}/`
