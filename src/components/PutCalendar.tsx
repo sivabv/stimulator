@@ -29,6 +29,7 @@ import dayjs from "dayjs";
 import * as XLSX from "xlsx";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDates2026Json from "../assets/trading_dates_2026.json";
+import dataJson from "../assets/data.json";
 import NetValueChart from "./NetValueChart";
 import type {
   OptionsInput,
@@ -125,6 +126,47 @@ type MasterStockData = Record<string, CachedStockResponse>;
 
 const MASTER_OPTION_DATA_KEY = "masterOptionData";
 const MASTER_STOCK_DATA_KEY = "masterStockData";
+const parsedDataJson =
+  dataJson && typeof dataJson === "object" && !Array.isArray(dataJson)
+    ? (dataJson as {
+      masterOptionData?: Record<string, Partial<CachedOptionResponse>>;
+      masterStockData?: Record<string, Partial<CachedStockResponse>>;
+    })
+    : {};
+
+const DATA_FILE_OPTION_DATA: MasterOptionData = Object.fromEntries(
+  Object.entries(parsedDataJson.masterOptionData ?? {}).map(([key, entry]) => [
+    key,
+    {
+      symbol: entry.symbol ?? "",
+      expiryDate: entry.expiryDate ?? "",
+      strikePrice: Number.isFinite(entry.strikePrice) ? entry.strikePrice as number : Number.NaN,
+      optionType: entry.optionType === "C" ? "C" : "P",
+      date: entry.date ?? "",
+      openPrice: entry.openPrice ?? null,
+      closePrice: entry.closePrice ?? null,
+      delta: entry.delta ?? null,
+      theta: entry.theta ?? null,
+      soldPrice: entry.soldPrice ?? null,
+      costPrice: entry.costPrice ?? null,
+      statusCode: entry.statusCode ?? null,
+      skipFuture: entry.skipFuture ?? false,
+    } satisfies CachedOptionResponse,
+  ])
+);
+
+const DATA_FILE_STOCK_DATA: MasterStockData = Object.fromEntries(
+  Object.entries(parsedDataJson.masterStockData ?? {}).map(([key, entry]) => [
+    key,
+    {
+      symbol: entry.symbol ?? "",
+      date: entry.date ?? "",
+      openPrice: entry.openPrice ?? null,
+      closePrice: entry.closePrice ?? null,
+      statusCode: entry.statusCode ?? null,
+    } satisfies CachedStockResponse,
+  ])
+);
 const tradingDates2026 = new Set<string>(tradingDates2026Json as string[]);
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
@@ -567,6 +609,30 @@ const PutCalendar: React.FC = () => {
     optionType: "C" | "P",
     date: string
   ) => {
+    const fileCacheKey = getCacheKey(symbol, expiryDate, strikePrice, optionType, date);
+    const optionDataFromFile = DATA_FILE_OPTION_DATA[fileCacheKey];
+    const hasOptionDataInFile =
+      Boolean(optionDataFromFile) &&
+      optionDataFromFile.statusCode !== 404 &&
+      (
+        optionDataFromFile.openPrice !== null ||
+        optionDataFromFile.closePrice !== null ||
+        optionDataFromFile.soldPrice !== null ||
+        optionDataFromFile.costPrice !== null
+      );
+
+    if (hasOptionDataInFile && optionDataFromFile) {
+      return {
+        openPrice: optionDataFromFile.openPrice,
+        closePrice: optionDataFromFile.closePrice,
+        delta: optionDataFromFile.delta,
+        theta: optionDataFromFile.theta,
+        soldPrice: optionDataFromFile.soldPrice,
+        costPrice: optionDataFromFile.costPrice,
+        statusCode: optionDataFromFile.statusCode,
+      };
+    }
+
     let response = await fetchOptionOpenClose(symbol, expiryDate, strikePrice, optionType, date);
     let attempts = 0;
 
@@ -581,6 +647,23 @@ const PutCalendar: React.FC = () => {
   };
 
   const fetchStockWithRateLimitRetry = async (symbol: string, date: string) => {
+    const stockCacheKey = `${symbol}|${date}`;
+    const stockDataFromFile = DATA_FILE_STOCK_DATA[stockCacheKey];
+    const hasStockDataInFile =
+      Boolean(stockDataFromFile) &&
+      stockDataFromFile.statusCode !== 404 &&
+      (stockDataFromFile.openPrice !== null || stockDataFromFile.closePrice !== null);
+
+    if (hasStockDataInFile && stockDataFromFile) {
+      return {
+        openPrice: stockDataFromFile.openPrice,
+        closePrice: stockDataFromFile.closePrice,
+        delta: null,
+        theta: null,
+        statusCode: stockDataFromFile.statusCode,
+      };
+    }
+
     let response = await fetchStockOpenClose(symbol, date);
     let attempts = 0;
 
@@ -1729,6 +1812,56 @@ const PutCalendar: React.FC = () => {
     message.success("Option cache cleared");
   };
 
+  const downloadLocalStorageJson = () => {
+    try {
+      const masterOptionData = loadMasterOptionData();
+      const masterStockData = loadMasterStockData();
+
+      const filteredOptionEntries = Object.entries(masterOptionData).filter(([, entry]) => {
+        const hasFoundPrice =
+          entry.openPrice !== null ||
+          entry.closePrice !== null ||
+          entry.soldPrice !== null ||
+          entry.costPrice !== null;
+        return hasFoundPrice && entry.statusCode !== 404;
+      });
+
+      const filteredStockEntries = Object.entries(masterStockData).filter(([, entry]) => {
+        const hasFoundPrice = entry.openPrice !== null || entry.closePrice !== null;
+        return hasFoundPrice && entry.statusCode !== 404;
+      });
+
+      if (filteredOptionEntries.length === 0 && filteredStockEntries.length === 0) {
+        message.warning("No stock or option prices found in local cache to export");
+        return;
+      }
+
+      const payload = {
+        generatedAt: dayjs().toISOString(),
+        storageFormat: "localStorage",
+        [MASTER_OPTION_DATA_KEY]: Object.fromEntries(filteredOptionEntries),
+        [MASTER_STOCK_DATA_KEY]: Object.fromEntries(filteredStockEntries),
+      };
+
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const timestamp = dayjs().format("YYYYMMDD-HHmmss");
+      link.href = url;
+      link.download = `local-cache-price-data-${timestamp}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      message.success(
+        `Exported ${filteredStockEntries.length} stock and ${filteredOptionEntries.length} option cache records`
+      );
+    } catch {
+      message.error("Failed to export local cache JSON");
+    }
+  };
+
   const buildNetValueChartData = (rows: OptionsAnalysisRowV2[]) =>
     rows
       .map((row, index) => {
@@ -2668,17 +2801,22 @@ const PutCalendar: React.FC = () => {
           zIndex: 1000,
         }}
       >
-        <Popconfirm
-          title="Clear option cache?"
-          description="This will remove only saved option data from local storage. Stock cache will be kept."
-          okText="Clear"
-          cancelText="Cancel"
-          onConfirm={clearLocalStorageCache}
-        >
-          <Button danger icon={<DeleteOutlined />}>
-            Clear Local Cache
+        <Space direction="vertical" size="small">
+          <Button icon={<DownloadOutlined />} onClick={downloadLocalStorageJson}>
+            Download Local Cache JSON
           </Button>
-        </Popconfirm>
+          <Popconfirm
+            title="Clear option cache?"
+            description="This will remove only saved option data from local storage. Stock cache will be kept."
+            okText="Clear"
+            cancelText="Cancel"
+            onConfirm={clearLocalStorageCache}
+          >
+            <Button danger icon={<DeleteOutlined />}>
+              Clear Local Cache
+            </Button>
+          </Popconfirm>
+        </Space>
       </div>
 
       <Modal
