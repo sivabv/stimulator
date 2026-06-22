@@ -84,13 +84,10 @@ The dashboard will open at `http://localhost:5173`. API calls are proxied to `ht
 ## GitHub Pages Deployment
 
 - The repository includes `.github/workflows/deploy-pages.yml` to build and deploy the Vite app to GitHub Pages on every push to `main`.
-- Vite derives a project-site base path from the repository name by default, but the Pages workflow overrides `VITE_BASE_PATH=/` because the intended deployment target is the root Pages URL `https://<owner>.github.io` (for this repository, `https://sivabv.github.io`).
+- The Pages workflow sets `VITE_BASE_PATH=/stimulator/` so assets resolve correctly under the project site at **`https://sivabv.github.io/stimulator`**.
 - In GitHub repository settings, ensure **Settings → Pages → Build and deployment → Source** is set to **GitHub Actions**.
 - This deployment publishes only the static frontend. The local `/api` dev proxy remains available in `npm run dev`, but GitHub Pages does not host the FastAPI backend.
 - If the deployed site should call a hosted backend, set `VITE_API_BASE_URL` for the workflow or repository environment so the frontend points at that backend instead of `http://localhost:8000`.
-- If the site is instead published as a normal project Pages site, change `VITE_BASE_PATH` in `.github/workflows/deploy-pages.yml` to `/<repository-name>/`.
-- Here `<repository-name>` means the repository slug segment, for example `/stimulator/`.
-- You can also remove the override entirely and let Vite derive the project-site base path automatically.
 
 ## API Endpoints
 
