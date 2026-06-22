@@ -81,6 +81,14 @@ npm run dev
 
 The dashboard will open at `http://localhost:5173`. API calls are proxied to `http://localhost:8000` via Vite's dev server proxy.
 
+## GitHub Pages Deployment
+
+- The repository includes `.github/workflows/deploy-pages.yml` to build and deploy the Vite app to GitHub Pages on every push to `main`.
+- The Vite base path is configured for the target Pages URL `https://sivabv.github.io`, so built assets are emitted for the site root.
+- In GitHub repository settings, ensure **Settings → Pages → Build and deployment → Source** is set to **GitHub Actions**.
+- This deployment publishes only the static frontend. The local `/api` dev proxy remains available in `npm run dev`, but GitHub Pages does not host the FastAPI backend.
+- If the deployed site should call a hosted backend, set `VITE_API_BASE_URL` for the workflow or repository environment so the frontend points at that backend instead of `http://localhost:8000`.
+
 ## API Endpoints
 
 ### `GET /api/prices`
@@ -228,6 +236,4 @@ Long Expiry Date
 
 Calendar call
 Calendar Put
-
-
 
