@@ -1,0 +1,930 @@
+import React, { useState } from "react";
+import {
+  Alert,
+  Button,
+  Card,
+  Col,
+  DatePicker,
+  Input,
+  InputNumber,
+  Modal,
+  Row,
+  Space,
+  Table,
+  Tag,
+  Typography,
+  message,
+} from "antd";
+import { PlayCircleOutlined } from "@ant-design/icons";
+import dayjs from "dayjs";
+import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
+import tradingDatesJson from "../assets/trading_dates_2026.json";
+
+const { Text } = Typography;
+
+type RowStatus = "active" | "rolled" | "expired";
+
+interface CallCalendarRow {
+  key: string;
+  date: string;
+  closingPrice: number | null;
+  strike: number;
+  shortExpiryDate: string;
+  longExpiryDate: string;
+  shortCallPrice: number | null;
+  longCallPrice: number | null;
+  entryNetCredit: number | null;
+  rollCreditDebit: number | null;
+  closeNetCost: number | null;
+  legPnl: number | null;
+  cumulativePnl: number | null;
+  status: RowStatus;
+  rollNumber: number;
+}
+
+interface CachedStockPrice {
+  symbol: string;
+  date: string;
+  closePrice: number | null;
+}
+
+interface ManualRollInstruction {
+  fromDate: string;
+  shortExpiryDate: string;
+  strike: number;
+  rollCreditDebit: number | null;
+}
+
+interface RollPreview {
+  currentShortCallPremium: number | null;
+  newShortCallPremium: number | null;
+  netCreditDebit: number | null;
+}
+
+type MasterStockData = Record<string, CachedStockPrice>;
+
+const RATE_LIMIT_WAIT_MS = 2_000;
+const MAX_RATE_LIMIT_RETRIES = 3;
+const MASTER_STOCK_DATA_KEY = "masterStockData";
+const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
+const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
+const LONG_EXPIRY_MIN_DTE_DAYS = 150;
+const LONG_EXPIRY_MAX_DTE_DAYS = 400;
+
+const tradingDates = (tradingDatesJson as string[])
+  .filter((value) => dayjs(value).isValid())
+  .sort((a, b) => dayjs(a).valueOf() - dayjs(b).valueOf());
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
+const formatExpiryDate = (dateStr: string): string => dayjs(dateStr).format("YYMMDD");
+
+const formatCurrency = (value: number | null) => {
+  if (value === null || !Number.isFinite(value)) return "-";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 2,
+  }).format(value);
+};
+
+const areRowsEqual = (left: CallCalendarRow, right: CallCalendarRow): boolean => {
+  return (
+    left.key === right.key &&
+    left.date === right.date &&
+    left.closingPrice === right.closingPrice &&
+    left.strike === right.strike &&
+    left.shortExpiryDate === right.shortExpiryDate &&
+    left.longExpiryDate === right.longExpiryDate &&
+    left.shortCallPrice === right.shortCallPrice &&
+    left.longCallPrice === right.longCallPrice &&
+    left.entryNetCredit === right.entryNetCredit &&
+    left.rollCreditDebit === right.rollCreditDebit &&
+    left.closeNetCost === right.closeNetCost &&
+    left.legPnl === right.legPnl &&
+    left.cumulativePnl === right.cumulativePnl &&
+    left.status === right.status &&
+    left.rollNumber === right.rollNumber
+  );
+};
+
+const mergeRows = (previousRows: CallCalendarRow[], nextRows: CallCalendarRow[]): CallCalendarRow[] => {
+  const previousByKey = new Map(previousRows.map((row) => [row.key, row]));
+  return nextRows.map((row) => {
+    const previous = previousByKey.get(row.key);
+    return previous && areRowsEqual(previous, row) ? previous : row;
+  });
+};
+
+const getFirstTradingDateOnOrAfter = (date: string): string | null =>
+  tradingDates.find((d) => !dayjs(d).isBefore(dayjs(date), "day")) ?? null;
+
+const getNextTradingDate = (date: string): string | null => {
+  const index = tradingDates.findIndex((value) => dayjs(value).isSame(dayjs(date), "day"));
+  if (index < 0 || index + 1 >= tradingDates.length) {
+    return null;
+  }
+  return tradingDates[index + 1];
+};
+
+const getExpiryDateCandidatesInDteWindow = (
+  baseDate: string,
+  minDteDays: number,
+  maxDteDays: number
+): string[] => {
+  const start = dayjs(baseDate).add(minDteDays, "day");
+  const end = dayjs(baseDate).add(maxDteDays, "day");
+
+  return tradingDates.filter((candidateDate) => {
+    const candidate = dayjs(candidateDate);
+    return (
+      (candidate.isAfter(start, "day") || candidate.isSame(start, "day")) &&
+      (candidate.isBefore(end, "day") || candidate.isSame(end, "day"))
+    );
+  });
+};
+
+const getCacheKey = (symbol: string, date: string) => `${symbol}|${date}`;
+
+const loadMasterStockData = (): MasterStockData => {
+  try {
+    const raw = localStorage.getItem(MASTER_STOCK_DATA_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as MasterStockData;
+  } catch {
+    return {};
+  }
+};
+
+const saveMasterStockData = (data: MasterStockData) => {
+  localStorage.setItem(MASTER_STOCK_DATA_KEY, JSON.stringify(data));
+};
+
+const CallCalendarSpreadRoll: React.FC = () => {
+  const [startDate, setStartDate] = useState("2025-01-02");
+  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("");
+  const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("");
+  const [stockTicker, setStockTicker] = useState("SPY");
+  const [autoRollWeeklyEnabled, setAutoRollWeeklyEnabled] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [rows, setRows] = useState<CallCalendarRow[]>([]);
+
+  const [manualRolls, setManualRolls] = useState<ManualRollInstruction[]>([]);
+  const [rollModalOpen, setRollModalOpen] = useState(false);
+  const [rollTargetRow, setRollTargetRow] = useState<CallCalendarRow | null>(null);
+  const [rollExpiryDate, setRollExpiryDate] = useState("");
+  const [rollStrike, setRollStrike] = useState<number>(0);
+  const [rollPreview, setRollPreview] = useState<RollPreview | null>(null);
+  const [rollPreviewLoading, setRollPreviewLoading] = useState(false);
+
+  const [summary, setSummary] = useState<{
+    shortExpiryDate: string;
+    longExpiryDate: string;
+    totalRolls: number;
+    totalPnl: number;
+    netCreditCollected: number;
+    autoRollStoppedReason?: string;
+  } | null>(null);
+
+  const fetchWithRateLimitRetry = async <T extends { statusCode: number | null }>(
+    work: () => Promise<T>
+  ) => {
+    let response = await work();
+    let attempts = 0;
+    while (response.statusCode === 429 && attempts < MAX_RATE_LIMIT_RETRIES) {
+      attempts += 1;
+      message.warning(`Rate limit hit (429). Waiting 2 seconds before retry ${attempts}.`);
+      await sleep(RATE_LIMIT_WAIT_MS);
+      response = await work();
+    }
+    return response;
+  };
+
+  const fetchStockWithCache = async (symbol: string, date: string): Promise<CachedStockPrice> => {
+    const masterData = loadMasterStockData();
+    const cacheKey = getCacheKey(symbol, date);
+    const cached = masterData[cacheKey];
+    if (cached) return cached;
+
+    const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(symbol, date));
+    const result: CachedStockPrice = { symbol, date, closePrice: stockData.closePrice };
+    masterData[cacheKey] = result;
+    saveMasterStockData(masterData);
+    return result;
+  };
+
+  const previewManualRoll = async (
+    row: CallCalendarRow,
+    nextShortExpiryDate: string,
+    nextStrike: number
+  ) => {
+    if (!dayjs(nextShortExpiryDate).isValid()) {
+      setRollPreview(null);
+      return;
+    }
+
+    setRollPreviewLoading(true);
+    try {
+      const preview = await getRollPreview(
+        row.date,
+        row.shortCallPrice,
+        nextShortExpiryDate,
+        nextStrike
+      );
+      setRollPreview(preview);
+    } finally {
+      setRollPreviewLoading(false);
+    }
+  };
+
+  const getRollPreview = async (
+    currentDate: string,
+    currentShortCallPremium: number | null,
+    nextShortExpiryDate: string,
+    nextStrike: number
+  ): Promise<RollPreview> => {
+    const symbol = stockTicker.trim().toUpperCase();
+    const expiryFormatted = formatExpiryDate(nextShortExpiryDate);
+    const newShortCallData = await fetchWithRateLimitRetry(() =>
+      fetchOptionOpenClose(symbol, expiryFormatted, nextStrike, "C", currentDate)
+    );
+
+    const newShortCallPremium = newShortCallData.closePrice;
+    const netCreditDebit =
+      currentShortCallPremium !== null && newShortCallPremium !== null
+        ? newShortCallPremium - currentShortCallPremium
+        : null;
+
+    return { currentShortCallPremium, newShortCallPremium, netCreditDebit };
+  };
+
+  const openRollModal = (row: CallCalendarRow) => {
+    const defaultRollExpiryDate = getNextTradingDate(row.shortExpiryDate) ?? row.shortExpiryDate;
+    setRollTargetRow(row);
+    setRollExpiryDate(defaultRollExpiryDate);
+    setRollStrike(row.strike);
+    setRollPreview(null);
+    setRollModalOpen(true);
+    void previewManualRoll(row, defaultRollExpiryDate, row.strike);
+  };
+
+  const handleAutoRollOneWeek = async (row: CallCalendarRow) => {
+    const nextTradingDate = getNextTradingDate(row.date);
+    if (!nextTradingDate) {
+      message.error("No next trading date available for this auto roll");
+      return;
+    }
+
+    try {
+      const targetFromDate = dayjs(row.shortExpiryDate).add(7, "day").format("YYYY-MM-DD");
+      const candidateExpiries = tradingDates.filter((value) =>
+        dayjs(value).isSame(dayjs(targetFromDate), "day") || dayjs(value).isAfter(dayjs(targetFromDate), "day")
+      );
+
+      let autoRollExpiryDate: string | null = null;
+      let preview: RollPreview | null = null;
+
+      for (const candidate of candidateExpiries) {
+        const candidatePreview = await getRollPreview(
+          row.date,
+          row.shortCallPrice,
+          candidate,
+          row.strike
+        );
+        if (candidatePreview.newShortCallPremium !== null) {
+          autoRollExpiryDate = candidate;
+          preview = candidatePreview;
+          break;
+        }
+      }
+
+      if (!autoRollExpiryDate || !preview) {
+        message.error("No option data exists for auto roll targets on/after +1 week");
+        return;
+      }
+
+      const updated = [
+        ...manualRolls.filter((roll) => !dayjs(roll.fromDate).isSame(dayjs(nextTradingDate), "day")),
+        {
+          fromDate: nextTradingDate,
+          shortExpiryDate: autoRollExpiryDate,
+          strike: row.strike,
+          rollCreditDebit: preview.netCreditDebit,
+        },
+      ].sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
+
+      setManualRolls(updated);
+      await runSimulation(updated);
+      message.success(`Auto roll scheduled to ${autoRollExpiryDate}`);
+    } catch {
+      message.error("Failed to auto roll by 1 week using available option data");
+    }
+  };
+
+  const runSimulation = async (activeManualRolls: ManualRollInstruction[]) => {
+    setError(null);
+    setSummary(null);
+    setLoading(true);
+
+    try {
+      const symbol = stockTicker.trim().toUpperCase();
+      if (!symbol) throw new Error("Stock ticker is required");
+      if (!dayjs(startDate).isValid()) throw new Error("Start date is invalid");
+      if (preferredShortExpiryDate && !dayjs(preferredShortExpiryDate).isValid()) {
+        throw new Error("Short expiry date is invalid");
+      }
+      if (preferredLongExpiryDate && !dayjs(preferredLongExpiryDate).isValid()) {
+        throw new Error("Long expiry date is invalid");
+      }
+
+      const firstDate = getFirstTradingDateOnOrAfter(startDate);
+      if (!firstDate) throw new Error("No trading date found on or after the start date");
+
+      const openingStockResult = await fetchStockWithCache(symbol, firstDate);
+      const openingClosePrice = openingStockResult.closePrice;
+      if (openingClosePrice === null) {
+        throw new Error(`No stock close price found for ${symbol} on ${firstDate}`);
+      }
+      const openingStrike = roundToNearestFive(openingClosePrice);
+
+      const hasCallData = async (expiryDate: string): Promise<boolean> => {
+        const expiryFormatted = formatExpiryDate(expiryDate);
+        const ceData = await fetchWithRateLimitRetry(() =>
+          fetchOptionOpenClose(symbol, expiryFormatted, openingStrike, "C", firstDate)
+        );
+        return ceData.statusCode === 200 && ceData.closePrice !== null;
+      };
+
+      const resolveExpiryDate = async (
+        preferredExpiryDate: string,
+        minDteDays: number,
+        maxDteDays: number,
+        label: "short" | "long"
+      ): Promise<string> => {
+        if (preferredExpiryDate) {
+          const preferredHasData = await hasCallData(preferredExpiryDate);
+          if (!preferredHasData) {
+            throw new Error(
+              `${label === "short" ? "Short" : "Long"} expiry has no call option data for ${symbol} on ${firstDate} at strike ${openingStrike}`
+            );
+          }
+          return preferredExpiryDate;
+        }
+
+        const candidates = getExpiryDateCandidatesInDteWindow(firstDate, minDteDays, maxDteDays);
+        for (const candidate of candidates) {
+          if (await hasCallData(candidate)) {
+            return candidate;
+          }
+        }
+
+        throw new Error(
+          `No ${label} expiry date found in the ${minDteDays}-${maxDteDays} DTE window with call option data`
+        );
+      };
+
+      const initialShortExpiryDate = await resolveExpiryDate(
+        preferredShortExpiryDate,
+        SHORT_EXPIRY_MIN_DTE_DAYS,
+        SHORT_EXPIRY_MAX_DTE_DAYS,
+        "short"
+      );
+      const longExpiryDate = await resolveExpiryDate(
+        preferredLongExpiryDate,
+        LONG_EXPIRY_MIN_DTE_DAYS,
+        LONG_EXPIRY_MAX_DTE_DAYS,
+        "long"
+      );
+
+      const relevantRolls = [...activeManualRolls]
+        .filter((roll) =>
+          dayjs(roll.fromDate).isAfter(dayjs(firstDate), "day") ||
+          dayjs(roll.fromDate).isSame(dayjs(firstDate), "day")
+        )
+        .sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
+
+      const simulationEndDate = autoRollWeeklyEnabled
+        ? longExpiryDate
+        : relevantRolls.reduce((maxDate, roll) => {
+            return dayjs(roll.shortExpiryDate).isAfter(dayjs(maxDate), "day")
+              ? roll.shortExpiryDate
+              : maxDate;
+          }, initialShortExpiryDate);
+
+      if (dayjs(longExpiryDate).isBefore(dayjs(simulationEndDate), "day")) {
+        throw new Error("Long expiry date must be after the latest short expiry date");
+      }
+
+      const dates = tradingDates.filter((candidateDate) => {
+        const day = dayjs(candidateDate);
+        return (
+          (day.isAfter(dayjs(firstDate), "day") || day.isSame(dayjs(firstDate), "day")) &&
+          (day.isBefore(dayjs(simulationEndDate), "day") || day.isSame(dayjs(simulationEndDate), "day"))
+        );
+      });
+
+      if (dates.length === 0) {
+        throw new Error(`No trading dates found between ${firstDate} and ${simulationEndDate}`);
+      }
+
+      const allRows: CallCalendarRow[] = [];
+      let activeShortExpiryDate = initialShortExpiryDate;
+      let activeStrike = openingStrike;
+      let rollNumber = 0;
+      let entryNetCredit: number | null = null;
+      let realisedPnl = 0;
+      let totalNetCreditCollected = 0;
+      let autoRollStoppedReason: string | null = null;
+
+      for (let i = 0; i < dates.length; i++) {
+        const date = dates[i];
+        const rollForToday = relevantRolls.find((roll) => dayjs(roll.fromDate).isSame(dayjs(date), "day"));
+        const rolledToday = Boolean(rollForToday);
+        const rollCreditDebit = rollForToday?.rollCreditDebit ?? null;
+
+        if (rollForToday) {
+          activeShortExpiryDate = rollForToday.shortExpiryDate;
+          activeStrike = roundToNearestFive(rollForToday.strike);
+          entryNetCredit = null;
+          rollNumber += 1;
+          realisedPnl += rollForToday.rollCreditDebit ?? 0;
+        }
+
+        const stockResult = await fetchStockWithCache(symbol, date);
+        const closePrice = stockResult.closePrice;
+        if (closePrice === null) {
+          continue;
+        }
+
+        const shortExpFmt = formatExpiryDate(activeShortExpiryDate);
+        const longExpFmt = formatExpiryDate(longExpiryDate);
+
+        const [shortCallData, longCallData] = await Promise.all([
+          fetchWithRateLimitRetry(() =>
+            fetchOptionOpenClose(symbol, shortExpFmt, activeStrike, "C", date)
+          ),
+          fetchWithRateLimitRetry(() =>
+            fetchOptionOpenClose(symbol, longExpFmt, activeStrike, "C", date)
+          ),
+        ]);
+
+        const shortCallPrice = shortCallData.closePrice;
+        const longCallPrice = longCallData.closePrice;
+        const currentNetCloseCost =
+          shortCallPrice !== null && longCallPrice !== null ? shortCallPrice - longCallPrice : null;
+
+        if (entryNetCredit === null) {
+          entryNetCredit = currentNetCloseCost;
+          totalNetCreditCollected += entryNetCredit ?? 0;
+        }
+
+        const isExpiry = dayjs(date).isSame(dayjs(activeShortExpiryDate), "day");
+        const isLastDate = i === dates.length - 1;
+
+        let status: RowStatus;
+        let closeNetCost: number | null = null;
+        let legPnl: number | null = null;
+
+        if (rolledToday) {
+          status = "rolled";
+        } else if (isExpiry || isLastDate) {
+          status = "expired";
+          closeNetCost = currentNetCloseCost;
+          legPnl =
+            entryNetCredit !== null && closeNetCost !== null ? entryNetCredit - closeNetCost : null;
+          if (legPnl !== null) realisedPnl += legPnl;
+        } else {
+          status = "active";
+        }
+
+        const unrealisedPnl =
+          status === "active" && entryNetCredit !== null && currentNetCloseCost !== null
+            ? entryNetCredit - currentNetCloseCost
+            : 0;
+
+        allRows.push({
+          key: `${rollNumber}-${date}`,
+          date,
+          closingPrice: closePrice,
+          strike: activeStrike,
+          shortExpiryDate: activeShortExpiryDate,
+          longExpiryDate,
+          shortCallPrice,
+          longCallPrice,
+          entryNetCredit,
+          rollCreditDebit,
+          closeNetCost: status !== "active" ? closeNetCost : null,
+          legPnl: status !== "active" ? legPnl : null,
+          cumulativePnl: realisedPnl + unrealisedPnl,
+          status,
+          rollNumber,
+        });
+
+        if (autoRollWeeklyEnabled) {
+          const nextTradingDate = getNextTradingDate(date);
+          if (!nextTradingDate) {
+            autoRollStoppedReason = `Auto roll stopped after ${date}: no next trading date available.`;
+            break;
+          }
+
+          const hasExistingRollForNextTradingDate = relevantRolls.some((roll) =>
+            dayjs(roll.fromDate).isSame(dayjs(nextTradingDate), "day")
+          );
+
+          if (!hasExistingRollForNextTradingDate) {
+            const targetFromDate = dayjs(activeShortExpiryDate).add(7, "day").format("YYYY-MM-DD");
+            const candidateExpiries = tradingDates.filter((value) =>
+              dayjs(value).isSame(dayjs(targetFromDate), "day") ||
+              dayjs(value).isAfter(dayjs(targetFromDate), "day")
+            );
+
+            let autoRollExpiryDate: string | null = null;
+            let autoPreview: RollPreview | null = null;
+
+            for (const candidate of candidateExpiries) {
+              const candidatePreview = await getRollPreview(
+                date,
+                shortCallPrice,
+                candidate,
+                activeStrike
+              );
+              if (candidatePreview.newShortCallPremium !== null) {
+                autoRollExpiryDate = candidate;
+                autoPreview = candidatePreview;
+                break;
+              }
+            }
+
+            if (!autoRollExpiryDate || !autoPreview) {
+              autoRollStoppedReason =
+                `Auto roll stopped after ${date}: no option data for mandatory roll targets ` +
+                `on/after ${targetFromDate}.`;
+              break;
+            }
+
+            relevantRolls.push({
+              fromDate: nextTradingDate,
+              shortExpiryDate: autoRollExpiryDate,
+              strike: activeStrike,
+              rollCreditDebit: autoPreview.netCreditDebit,
+            });
+            relevantRolls.sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
+          }
+        }
+      }
+
+      setRows((previousRows) => mergeRows(previousRows, allRows));
+
+      if (autoRollStoppedReason) {
+        message.warning(autoRollStoppedReason);
+      }
+
+      const actualSimulationEndDate =
+        allRows.length > 0 ? allRows[allRows.length - 1].date : simulationEndDate;
+
+      setSummary({
+        shortExpiryDate: actualSimulationEndDate,
+        longExpiryDate,
+        totalRolls: rollNumber,
+        totalPnl: realisedPnl,
+        netCreditCollected: totalNetCreditCollected,
+        autoRollStoppedReason: autoRollStoppedReason ?? undefined,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to run call calendar spread simulation");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRun = async () => {
+    setManualRolls([]);
+    await runSimulation([]);
+  };
+
+  const confirmManualRoll = async () => {
+    if (!rollTargetRow) return;
+    if (!dayjs(rollExpiryDate).isValid()) {
+      message.error("Please choose a valid short expiry date");
+      return;
+    }
+    if (!Number.isFinite(rollStrike) || rollStrike <= 0) {
+      message.error("Please choose a valid strike price");
+      return;
+    }
+
+    const nextTradingDate = getNextTradingDate(rollTargetRow.date);
+    if (!nextTradingDate) {
+      message.error("No next trading date available for this roll");
+      return;
+    }
+
+    const updated = [
+      ...manualRolls.filter((roll) => !dayjs(roll.fromDate).isSame(dayjs(nextTradingDate), "day")),
+      {
+        fromDate: nextTradingDate,
+        shortExpiryDate: rollExpiryDate,
+        strike: roundToNearestFive(rollStrike),
+        rollCreditDebit: rollPreview?.netCreditDebit ?? null,
+      },
+    ].sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
+
+    setManualRolls(updated);
+    setRollModalOpen(false);
+    await runSimulation(updated);
+  };
+
+  const statusTag = (status: RowStatus) => {
+    if (status === "rolled") return <Tag color="orange">Rolled</Tag>;
+    if (status === "expired") return <Tag color="red">Expired</Tag>;
+    return <Tag color="green">Active</Tag>;
+  };
+
+  return (
+    <Space direction="vertical" size={20} style={{ width: "100%" }}>
+      <Card title="Call Calendar Spread (Roll)">
+        <Row gutter={[16, 16]}>
+          <Col xs={24} md={12} lg={6}>
+            <Text>Start Date</Text>
+            <DatePicker
+              value={dayjs(startDate)}
+              onChange={(v) => setStartDate(v ? v.format("YYYY-MM-DD") : "")}
+              style={{ width: "100%", marginTop: 8 }}
+            />
+          </Col>
+          <Col xs={24} md={12} lg={6}>
+            <Text>Short Expiry Date (optional)</Text>
+            <DatePicker
+              value={preferredShortExpiryDate ? dayjs(preferredShortExpiryDate) : null}
+              onChange={(v) => setPreferredShortExpiryDate(v ? v.format("YYYY-MM-DD") : "")}
+              style={{ width: "100%", marginTop: 8 }}
+              placeholder="Auto 15-75 DTE"
+            />
+          </Col>
+          <Col xs={24} md={12} lg={6}>
+            <Text>Long Expiry Date (optional)</Text>
+            <DatePicker
+              value={preferredLongExpiryDate ? dayjs(preferredLongExpiryDate) : null}
+              onChange={(v) => setPreferredLongExpiryDate(v ? v.format("YYYY-MM-DD") : "")}
+              style={{ width: "100%", marginTop: 8 }}
+              placeholder="Auto 150-400 DTE"
+            />
+          </Col>
+          <Col xs={24} md={12} lg={6}>
+            <Text>Stock ticker</Text>
+            <Input
+              value={stockTicker}
+              onChange={(e) => setStockTicker(e.target.value.toUpperCase())}
+              style={{ marginTop: 8 }}
+              placeholder="SPY"
+            />
+          </Col>
+        </Row>
+
+        <Space style={{ marginTop: 16 }}>
+          <Button type="primary" icon={<PlayCircleOutlined />} onClick={handleRun} loading={loading}>
+            Run Call Calendar Spread
+          </Button>
+          <Button
+            type={autoRollWeeklyEnabled ? "primary" : "default"}
+            onClick={() => setAutoRollWeeklyEnabled((previous) => !previous)}
+            disabled={loading}
+          >
+            Auto Roll Weekly: {autoRollWeeklyEnabled ? "ON" : "OFF"}
+          </Button>
+        </Space>
+      </Card>
+
+      {error && <Alert type="error" showIcon message="Call Calendar Spread Error" description={error} />}
+
+      {summary && (
+        <Card title="Summary">
+          <Row gutter={[24, 8]}>
+            <Col xs={24} sm={8}>
+              <Text strong>Simulation End: </Text>
+              <Text>{summary.shortExpiryDate}</Text>
+            </Col>
+            <Col xs={24} sm={8}>
+              <Text strong>Long Expiry: </Text>
+              <Text>{summary.longExpiryDate}</Text>
+            </Col>
+            <Col xs={24} sm={8}>
+              <Text strong>Total Rolls: </Text>
+              <Text>{summary.totalRolls}</Text>
+            </Col>
+            <Col xs={24} sm={8}>
+              <Text strong>Total Net Credit: </Text>
+              <Text>{formatCurrency(summary.netCreditCollected)}</Text>
+            </Col>
+            <Col xs={24} sm={8}>
+              <Text strong>Realised P&L: </Text>
+              <Text style={{ color: summary.totalPnl >= 0 ? "#3f8600" : "#cf1322" }}>
+                {formatCurrency(summary.totalPnl)}
+              </Text>
+            </Col>
+            {summary.autoRollStoppedReason && (
+              <Col xs={24}>
+                <Text type="secondary">{summary.autoRollStoppedReason}</Text>
+              </Col>
+            )}
+          </Row>
+        </Card>
+      )}
+
+      <Card title="Records">
+        <Table<CallCalendarRow>
+          rowKey="key"
+          loading={loading}
+          dataSource={rows}
+          pagination={{ pageSize: 50, showSizeChanger: true }}
+          scroll={{ x: "max-content" }}
+          columns={[
+            { title: "Roll #", dataIndex: "rollNumber", key: "rollNumber", width: 70 },
+            { title: "Date", dataIndex: "date", key: "date", width: 110 },
+            {
+              title: "Closing Price",
+              dataIndex: "closingPrice",
+              key: "closingPrice",
+              width: 130,
+              render: (v: number | null) => formatCurrency(v),
+            },
+            {
+              title: "Strike",
+              dataIndex: "strike",
+              key: "strike",
+              width: 100,
+              render: (v: number) => formatCurrency(v),
+            },
+            { title: "Short Expiry", dataIndex: "shortExpiryDate", key: "shortExpiryDate", width: 120 },
+            { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
+            {
+              title: "Short Call",
+              dataIndex: "shortCallPrice",
+              key: "shortCallPrice",
+              width: 120,
+              render: (v: number | null) => formatCurrency(v),
+            },
+            {
+              title: "Long Call",
+              dataIndex: "longCallPrice",
+              key: "longCallPrice",
+              width: 120,
+              render: (v: number | null) => formatCurrency(v),
+            },
+            {
+              title: "Entry Net Credit",
+              dataIndex: "entryNetCredit",
+              key: "entryNetCredit",
+              width: 140,
+              render: (v: number | null) => formatCurrency(v),
+            },
+            {
+              title: "Close Net Cost",
+              dataIndex: "closeNetCost",
+              key: "closeNetCost",
+              width: 130,
+              render: (v: number | null) => (v !== null ? formatCurrency(v) : "-"),
+            },
+            {
+              title: "Leg P&L",
+              dataIndex: "legPnl",
+              key: "legPnl",
+              width: 110,
+              render: (v: number | null) =>
+                v !== null ? (
+                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
+                ) : (
+                  "-"
+                ),
+            },
+            {
+              title: "Roll Credit/Debit",
+              dataIndex: "rollCreditDebit",
+              key: "rollCreditDebit",
+              width: 140,
+              render: (v: number | null) =>
+                v !== null ? (
+                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
+                ) : (
+                  "-"
+                ),
+            },
+            {
+              title: "Cumulative P&L",
+              dataIndex: "cumulativePnl",
+              key: "cumulativePnl",
+              width: 140,
+              render: (v: number | null) =>
+                v !== null ? (
+                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
+                ) : (
+                  "-"
+                ),
+            },
+            {
+              title: "Status",
+              dataIndex: "status",
+              key: "status",
+              width: 100,
+              render: (v: RowStatus) => statusTag(v),
+              filters: [
+                { text: "Active", value: "active" },
+                { text: "Rolled", value: "rolled" },
+                { text: "Expired", value: "expired" },
+              ],
+              onFilter: (value, record) => record.status === value,
+            },
+            {
+              title: "Action",
+              key: "action",
+              width: 220,
+              render: (_: unknown, row: CallCalendarRow) => (
+                <Space size={8}>
+                  <Button size="small" onClick={() => openRollModal(row)} disabled={loading}>
+                    Roll
+                  </Button>
+                  <Button size="small" onClick={() => void handleAutoRollOneWeek(row)} disabled={loading}>
+                    Auto Roll 1W
+                  </Button>
+                </Space>
+              ),
+            },
+          ]}
+        />
+      </Card>
+
+      <Modal
+        title="Roll Short Call"
+        open={rollModalOpen}
+        onCancel={() => setRollModalOpen(false)}
+        onOk={() => void confirmManualRoll()}
+        okText="Confirm Roll"
+        confirmLoading={loading}
+      >
+        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          <div>
+            <Text strong>Current Row Date: </Text>
+            <Text>{rollTargetRow?.date ?? "-"}</Text>
+          </div>
+          <div>
+            <Text strong>New Short Expiry</Text>
+            <DatePicker
+              value={rollExpiryDate ? dayjs(rollExpiryDate) : null}
+              onChange={(v) => {
+                const nextValue = v ? v.format("YYYY-MM-DD") : "";
+                setRollExpiryDate(nextValue);
+                if (rollTargetRow && nextValue && rollStrike > 0) {
+                  void previewManualRoll(rollTargetRow, nextValue, rollStrike);
+                }
+              }}
+              style={{ width: "100%", marginTop: 8 }}
+            />
+          </div>
+          <div>
+            <Text strong>New Strike</Text>
+            <InputNumber<number>
+              value={rollStrike}
+              onChange={(v) => {
+                const nextStrike = v ?? 0;
+                setRollStrike(nextStrike);
+                if (rollTargetRow && rollExpiryDate && nextStrike > 0) {
+                  void previewManualRoll(rollTargetRow, rollExpiryDate, nextStrike);
+                }
+              }}
+              style={{ width: "100%", marginTop: 8 }}
+              step={5}
+            />
+          </div>
+
+          <Card size="small" title="Roll Preview" loading={rollPreviewLoading}>
+            <Row gutter={[8, 8]}>
+              <Col span={24}>
+                <Text strong>Current Short Call Premium: </Text>
+                <Text>{formatCurrency(rollPreview?.currentShortCallPremium ?? null)}</Text>
+              </Col>
+              <Col span={24}>
+                <Text strong>New Short Call Premium: </Text>
+                <Text>{formatCurrency(rollPreview?.newShortCallPremium ?? null)}</Text>
+              </Col>
+              <Col span={24}>
+                <Text strong>Net Roll (Credit/Debit): </Text>
+                <Text
+                  style={{
+                    color: (rollPreview?.netCreditDebit ?? 0) >= 0 ? "#3f8600" : "#cf1322",
+                  }}
+                >
+                  {formatCurrency(rollPreview?.netCreditDebit ?? null)}
+                </Text>
+              </Col>
+            </Row>
+          </Card>
+        </Space>
+      </Modal>
+    </Space>
+  );
+};
+
+export default CallCalendarSpreadRoll;

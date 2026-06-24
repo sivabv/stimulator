@@ -17,6 +17,9 @@ import CallCalendar from "./components/CallCalendar";
 import InterestCalculator from "./components/InterestCalculator";
 import CoveredCall from "./components/CoveredCall";
 import CoveredPut from "./components/CoveredPut";
+import StraddleRolling from "./components/StraddleRolling";
+import PutCalendarSpreadRoll from "./components/PutCalendarSpreadRoll";
+import CallCalendarSpreadRoll from "./components/CallCalendarSpreadRoll";
 import { runBacktest } from "./api/backtest";
 import type { BacktestRequest, BacktestResponse } from "./types";
 
@@ -99,7 +102,11 @@ const App: React.FC = () => {
                     {/* Loading spinner */}
                     {loading && (
                       <div style={{ textAlign: "center", padding: 48 }}>
-                        <Spin size="large" tip="Running backtest…" />
+                        <Spin
+                          size="large"
+                          tip="Running backtest…"
+                          style={{ transform: "scale(0.6)", transformOrigin: "center" }}
+                        />
                       </div>
                     )}
 
@@ -152,6 +159,21 @@ const App: React.FC = () => {
                 key: "call-calendar",
                 label: "Call Calendar",
                 children: <CallCalendar />,
+              },
+              {
+                key: "straddle-rolling",
+                label: "Straddle Rolling",
+                children: <StraddleRolling />,
+              },
+              {
+                key: "put-calendar-spread-roll",
+                label: "Put Calendar Spread Roll",
+                children: <PutCalendarSpreadRoll />,
+              },
+              {
+                key: "call-calendar-spread-roll",
+                label: "Call Calendar Spread Roll",
+                children: <CallCalendarSpreadRoll />,
               },
             ]}
           />
