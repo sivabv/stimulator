@@ -20,6 +20,7 @@ import CoveredPut from "./components/CoveredPut";
 import StraddleRolling from "./components/StraddleRolling";
 import PutCalendarSpreadRoll from "./components/PutCalendarSpreadRoll";
 import CallCalendarSpreadRoll from "./components/CallCalendarSpreadRoll";
+import WeeklyStraddleRoll from "./components/WeeklyStraddleRoll";
 import { runBacktest } from "./api/backtest";
 import type { BacktestRequest, BacktestResponse } from "./types";
 
@@ -174,6 +175,11 @@ const App: React.FC = () => {
                 key: "call-calendar-spread-roll",
                 label: "Call Calendar Spread Roll",
                 children: <CallCalendarSpreadRoll />,
+              },
+              {
+                key: "weekly-straddle-roll",
+                label: "Weekly Straddle Roll",
+                children: <WeeklyStraddleRoll />,
               },
             ]}
           />

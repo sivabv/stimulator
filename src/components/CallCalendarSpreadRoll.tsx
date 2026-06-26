@@ -70,6 +70,8 @@ const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
 const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
 const LONG_EXPIRY_MIN_DTE_DAYS = 150;
 const LONG_EXPIRY_MAX_DTE_DAYS = 400;
+const MIN_AUTO_ROLL_CREDIT = 1.25;
+const AUTO_ROLL_MAX_STRIKE_STEPS = 8;
 
 const tradingDates = (tradingDatesJson as string[])
   .filter((value) => dayjs(value).isValid())
@@ -78,6 +80,15 @@ const tradingDates = (tradingDatesJson as string[])
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
 const formatExpiryDate = (dateStr: string): string => dayjs(dateStr).format("YYMMDD");
+const buildStrikeCandidates = (baseStrike: number, maxSteps: number): number[] => {
+  const candidates: number[] = [roundToNearestFive(baseStrike)];
+  for (let step = 1; step <= maxSteps; step += 1) {
+    const offset = step * 5;
+    candidates.push(roundToNearestFive(baseStrike + offset));
+    candidates.push(roundToNearestFive(baseStrike - offset));
+  }
+  return [...new Set(candidates)].filter((strike) => strike > 0);
+};
 
 const formatCurrency = (value: number | null) => {
   if (value === null || !Number.isFinite(value)) return "-";
@@ -86,6 +97,11 @@ const formatCurrency = (value: number | null) => {
     currency: "USD",
     maximumFractionDigits: 2,
   }).format(value);
+};
+
+const formatPercent = (value: number | null) => {
+  if (value === null || !Number.isFinite(value)) return "-";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 };
 
 const areRowsEqual = (left: CallCalendarRow, right: CallCalendarRow): boolean => {
@@ -181,12 +197,15 @@ const CallCalendarSpreadRoll: React.FC = () => {
   const [rollPreviewLoading, setRollPreviewLoading] = useState(false);
 
   const [summary, setSummary] = useState<{
-    shortExpiryDate: string;
-    longExpiryDate: string;
-    totalRolls: number;
-    totalPnl: number;
-    netCreditCollected: number;
-    autoRollStoppedReason?: string;
+    startDate: string;
+    endDate: string;
+    stockStartPrice: number;
+    stockEndPrice: number | null;
+    optionInvestment: number | null;
+    stockReturn: number | null;
+    stockReturnPct: number | null;
+    optionStrategyReturn: number;
+    optionStrategyReturnPct: number | null;
   } | null>(null);
 
   const fetchWithRateLimitRetry = async <T extends { statusCode: number | null }>(
@@ -285,24 +304,38 @@ const CallCalendarSpreadRoll: React.FC = () => {
       );
 
       let autoRollExpiryDate: string | null = null;
+      let autoRollStrike: number | null = null;
       let preview: RollPreview | null = null;
+      const strikeCandidates = buildStrikeCandidates(row.strike, AUTO_ROLL_MAX_STRIKE_STEPS);
 
       for (const candidate of candidateExpiries) {
-        const candidatePreview = await getRollPreview(
-          row.date,
-          row.shortCallPrice,
-          candidate,
-          row.strike
-        );
-        if (candidatePreview.newShortCallPremium !== null) {
-          autoRollExpiryDate = candidate;
-          preview = candidatePreview;
+        for (const candidateStrike of strikeCandidates) {
+          const candidatePreview = await getRollPreview(
+            row.date,
+            row.shortCallPrice,
+            candidate,
+            candidateStrike
+          );
+          if (
+            candidatePreview.newShortCallPremium !== null &&
+            candidatePreview.netCreditDebit !== null &&
+            candidatePreview.netCreditDebit >= MIN_AUTO_ROLL_CREDIT
+          ) {
+            autoRollExpiryDate = candidate;
+            autoRollStrike = candidateStrike;
+            preview = candidatePreview;
+            break;
+          }
+        }
+        if (autoRollExpiryDate && autoRollStrike !== null && preview) {
           break;
         }
       }
 
-      if (!autoRollExpiryDate || !preview) {
-        message.error("No option data exists for auto roll targets on/after +1 week");
+      if (!autoRollExpiryDate || autoRollStrike === null || !preview) {
+        message.error(
+          `No auto roll target found with minimum credit ${MIN_AUTO_ROLL_CREDIT.toFixed(2)} on/after +1 week`
+        );
         return;
       }
 
@@ -311,14 +344,16 @@ const CallCalendarSpreadRoll: React.FC = () => {
         {
           fromDate: nextTradingDate,
           shortExpiryDate: autoRollExpiryDate,
-          strike: row.strike,
+          strike: autoRollStrike,
           rollCreditDebit: preview.netCreditDebit,
         },
       ].sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
 
       setManualRolls(updated);
       await runSimulation(updated);
-      message.success(`Auto roll scheduled to ${autoRollExpiryDate}`);
+      message.success(
+        `Auto roll scheduled to ${autoRollExpiryDate} @ ${autoRollStrike} (credit ${formatCurrency(preview.netCreditDebit)})`
+      );
     } catch {
       message.error("Failed to auto roll by 1 week using available option data");
     }
@@ -436,7 +471,6 @@ const CallCalendarSpreadRoll: React.FC = () => {
       let rollNumber = 0;
       let entryNetCredit: number | null = null;
       let realisedPnl = 0;
-      let totalNetCreditCollected = 0;
       let autoRollStoppedReason: string | null = null;
 
       for (let i = 0; i < dates.length; i++) {
@@ -478,7 +512,6 @@ const CallCalendarSpreadRoll: React.FC = () => {
 
         if (entryNetCredit === null) {
           entryNetCredit = currentNetCloseCost;
-          totalNetCreditCollected += entryNetCredit ?? 0;
         }
 
         const isExpiry = dayjs(date).isSame(dayjs(activeShortExpiryDate), "day");
@@ -542,33 +575,45 @@ const CallCalendarSpreadRoll: React.FC = () => {
             );
 
             let autoRollExpiryDate: string | null = null;
+            let autoRollStrike: number | null = null;
             let autoPreview: RollPreview | null = null;
+            const strikeCandidates = buildStrikeCandidates(activeStrike, AUTO_ROLL_MAX_STRIKE_STEPS);
 
             for (const candidate of candidateExpiries) {
-              const candidatePreview = await getRollPreview(
-                date,
-                shortCallPrice,
-                candidate,
-                activeStrike
-              );
-              if (candidatePreview.newShortCallPremium !== null) {
-                autoRollExpiryDate = candidate;
-                autoPreview = candidatePreview;
+              for (const candidateStrike of strikeCandidates) {
+                const candidatePreview = await getRollPreview(
+                  date,
+                  shortCallPrice,
+                  candidate,
+                  candidateStrike
+                );
+                if (
+                  candidatePreview.newShortCallPremium !== null &&
+                  candidatePreview.netCreditDebit !== null &&
+                  candidatePreview.netCreditDebit >= MIN_AUTO_ROLL_CREDIT
+                ) {
+                  autoRollExpiryDate = candidate;
+                  autoRollStrike = candidateStrike;
+                  autoPreview = candidatePreview;
+                  break;
+                }
+              }
+              if (autoRollExpiryDate && autoRollStrike !== null && autoPreview) {
                 break;
               }
             }
 
-            if (!autoRollExpiryDate || !autoPreview) {
+            if (!autoRollExpiryDate || autoRollStrike === null || !autoPreview) {
               autoRollStoppedReason =
-                `Auto roll stopped after ${date}: no option data for mandatory roll targets ` +
-                `on/after ${targetFromDate}.`;
+                `Auto roll stopped after ${date}: no target met minimum credit ` +
+                `${MIN_AUTO_ROLL_CREDIT.toFixed(2)} on/after ${targetFromDate}.`;
               break;
             }
 
             relevantRolls.push({
               fromDate: nextTradingDate,
               shortExpiryDate: autoRollExpiryDate,
-              strike: activeStrike,
+              strike: autoRollStrike,
               rollCreditDebit: autoPreview.netCreditDebit,
             });
             relevantRolls.sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
@@ -582,16 +627,30 @@ const CallCalendarSpreadRoll: React.FC = () => {
         message.warning(autoRollStoppedReason);
       }
 
-      const actualSimulationEndDate =
-        allRows.length > 0 ? allRows[allRows.length - 1].date : simulationEndDate;
+      const initialOptionEntry = allRows.find((row) => row.entryNetCredit !== null)?.entryNetCredit ?? null;
+      const endingClosePrice = allRows.length > 0 ? allRows[allRows.length - 1].closingPrice : null;
+      const stockReturn =
+        endingClosePrice !== null ? endingClosePrice - openingClosePrice : null;
+      const stockReturnPct =
+        endingClosePrice !== null && openingClosePrice !== 0
+          ? ((endingClosePrice - openingClosePrice) / openingClosePrice) * 100
+          : null;
+      const optionStrategyReturnPct =
+        initialOptionEntry !== null && initialOptionEntry !== 0
+          ? (realisedPnl / Math.abs(initialOptionEntry)) * 100
+          : null;
+      const actualEndDate = allRows.length > 0 ? allRows[allRows.length - 1].date : firstDate;
 
       setSummary({
-        shortExpiryDate: actualSimulationEndDate,
-        longExpiryDate,
-        totalRolls: rollNumber,
-        totalPnl: realisedPnl,
-        netCreditCollected: totalNetCreditCollected,
-        autoRollStoppedReason: autoRollStoppedReason ?? undefined,
+        startDate: firstDate,
+        endDate: actualEndDate,
+        stockStartPrice: openingClosePrice,
+        stockEndPrice: endingClosePrice,
+        optionInvestment: initialOptionEntry !== null ? Math.abs(initialOptionEntry) : null,
+        stockReturn,
+        stockReturnPct,
+        optionStrategyReturn: realisedPnl,
+        optionStrategyReturnPct,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to run call calendar spread simulation");
@@ -704,32 +763,37 @@ const CallCalendarSpreadRoll: React.FC = () => {
         <Card title="Summary">
           <Row gutter={[24, 8]}>
             <Col xs={24} sm={8}>
-              <Text strong>Simulation End: </Text>
-              <Text>{summary.shortExpiryDate}</Text>
+              <Text strong>Start Date: </Text>
+              <Text>{summary.startDate}</Text>
             </Col>
             <Col xs={24} sm={8}>
-              <Text strong>Long Expiry: </Text>
-              <Text>{summary.longExpiryDate}</Text>
+              <Text strong>End Date: </Text>
+              <Text>{summary.endDate}</Text>
             </Col>
             <Col xs={24} sm={8}>
-              <Text strong>Total Rolls: </Text>
-              <Text>{summary.totalRolls}</Text>
+              <Text strong>Stock Start Price: </Text>
+              <Text>{formatCurrency(summary.stockStartPrice)}</Text>
             </Col>
             <Col xs={24} sm={8}>
-              <Text strong>Total Net Credit: </Text>
-              <Text>{formatCurrency(summary.netCreditCollected)}</Text>
+              <Text strong>Stock End Price: </Text>
+              <Text>{formatCurrency(summary.stockEndPrice)}</Text>
             </Col>
             <Col xs={24} sm={8}>
-              <Text strong>Realised P&L: </Text>
-              <Text style={{ color: summary.totalPnl >= 0 ? "#3f8600" : "#cf1322" }}>
-                {formatCurrency(summary.totalPnl)}
+              <Text strong>Option Investment: </Text>
+              <Text>{formatCurrency(summary.optionInvestment)}</Text>
+            </Col>
+            <Col xs={24} sm={8}>
+              <Text strong>Stock Return: </Text>
+              <Text style={{ color: (summary.stockReturn ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                {`${formatCurrency(summary.stockReturn)} (${formatPercent(summary.stockReturnPct)})`}
               </Text>
             </Col>
-            {summary.autoRollStoppedReason && (
-              <Col xs={24}>
-                <Text type="secondary">{summary.autoRollStoppedReason}</Text>
-              </Col>
-            )}
+            <Col xs={24} sm={8}>
+              <Text strong>Option Strategy Return: </Text>
+              <Text style={{ color: summary.optionStrategyReturn >= 0 ? "#3f8600" : "#cf1322" }}>
+                {`${formatCurrency(summary.optionStrategyReturn)} (${formatPercent(summary.optionStrategyReturnPct)})`}
+              </Text>
+            </Col>
           </Row>
         </Card>
       )}

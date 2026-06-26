@@ -236,3 +236,8 @@ Long Expiry Date
 
 Calendar call
 Calendar Put
+If I sell 1 put and 1 call ATM every Week 
+if sold option is in the money roll it to next day- continue and for 30 days with a counter rolled times 
+else mark it closed 
+given input date range- default 3 months
+Can you run this stimulation on a new tab? dont need prices- I need option list as tiles( exipry date- strike price/rolled count if any)
