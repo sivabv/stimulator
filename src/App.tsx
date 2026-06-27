@@ -141,6 +141,11 @@ const App: React.FC = () => {
                 label: "Interest Calculator",
                 children: <InterestCalculator />,
               },
+                {
+                key: "weekly-straddle-roll",
+                label: "Weekly Straddle Roll",
+                children: <WeeklyStraddleRoll />,
+              },
               {
                 key: "covered-call",
                 label: "Covered Call",
@@ -176,11 +181,7 @@ const App: React.FC = () => {
                 label: "Call Calendar Spread Roll",
                 children: <CallCalendarSpreadRoll />,
               },
-              {
-                key: "weekly-straddle-roll",
-                label: "Weekly Straddle Roll",
-                children: <WeeklyStraddleRoll />,
-              },
+            
             ]}
           />
         </Content>

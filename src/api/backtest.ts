@@ -4,6 +4,7 @@
  */
 
 import type { BacktestRequest, BacktestResponse, PricePoint } from "../types";
+import spyClosingData from "../assets/spy-closing.json";
 
 export interface OptionOpenClose {
   openPrice: number | null;
@@ -21,6 +22,23 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 // Massive.com API configuration
 const MASSIVE_API_KEY = "ZMR7fChWbrDYWqvT41rU_rE28HUEkQuS";
 const MASSIVE_BASE_URL = "https://api.massive.com/v1/open-close";
+const SPY_CLOSING_SERIES: Array<{ date: string; close: number | null }> = spyClosingData;
+const LOCAL_SPY_CLOSING_BY_DATE = new Map(
+  SPY_CLOSING_SERIES.map((point) => [point.date, point.close])
+);
+
+const isJanOrFeb = (date: string): boolean => {
+  const month = date.slice(5, 7);
+  return month === "01" || month === "02";
+};
+
+const getSpyCloseFromJanFebArray = (
+  symbol: string,
+  date: string
+): number | null | undefined => {
+  if (symbol !== "SPY" || !isJanOrFeb(date)) return undefined;
+  return LOCAL_SPY_CLOSING_BY_DATE.get(date);
+};
 
 /**
  * Fetch historical prices for a symbol within a date range.
@@ -138,13 +156,26 @@ export async function fetchStockOpenClose(
   symbol: string,
   date: string
 ): Promise<OptionOpenClose> {
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const spyJanFebClose = getSpyCloseFromJanFebArray(normalizedSymbol, date);
+
+  if (normalizedSymbol === "SPY" && isJanOrFeb(date)) {
+    return {
+      openPrice: null,
+      closePrice: spyJanFebClose ?? null,
+      delta: null,
+      theta: null,
+      statusCode: 200,
+    };
+  }
+
   try {
-    const url = `${MASSIVE_BASE_URL}/${symbol}/${date}?adjusted=true&apiKey=${MASSIVE_API_KEY}`;
+    const url = `${MASSIVE_BASE_URL}/${normalizedSymbol}/${date}?adjusted=true&apiKey=${MASSIVE_API_KEY}`;
 
     const res = await fetch(url);
 
     if (!res.ok) {
-      console.warn(`Failed to fetch stock price for ${symbol} on ${date}: ${res.status}`);
+      console.warn(`Failed to fetch stock price for ${normalizedSymbol} on ${date}: ${res.status}`);
       return {
         openPrice: null,
         closePrice: null,
