@@ -4,35 +4,151 @@
  * managing the backtest request lifecycle and error display.
  */
 
-import React, { useState } from "react";
-import { Layout, Typography, Alert, Spin, ConfigProvider, theme, Tabs } from "antd";
+import React, { Suspense, lazy, useState } from "react";
+import { Layout, Typography, Alert, Spin, ConfigProvider, theme, Tabs, Button, Modal, Descriptions, Space } from "antd";
+import { DownloadOutlined } from "@ant-design/icons";
 import FilterBar from "./components/FilterBar";
 import ResultsTable from "./components/ResultsTable";
 import PnLSummary from "./components/PnLSummary";
 import Charts from "./components/Charts";
-import OptionsAnalyzer from "./components/OptionsAnalyzer";
-import OptionsAnalyzerV2 from "./components/OptionsAnalyzerV2";
-import PutCalendar from "./components/PutCalendar";
-import CallCalendar from "./components/CallCalendar";
-import InterestCalculator from "./components/InterestCalculator";
-import CoveredCall from "./components/CoveredCall";
-import CoveredPut from "./components/CoveredPut";
-import StraddleRolling from "./components/StraddleRolling";
-import PutCalendarSpreadRoll from "./components/PutCalendarSpreadRoll";
-import CallCalendarSpreadRoll from "./components/CallCalendarSpreadRoll";
-import WeeklyStraddleRoll from "./components/WeeklyStraddleRoll";
 import { runBacktest } from "./api/backtest";
 import type { BacktestRequest, BacktestResponse } from "./types";
+import { getAllSqliteEntries, getSqliteMetrics } from "./utils/sqliteStorage";
 
 const { Header, Content, Footer } = Layout;
 const { Title } = Typography;
+
+const OptionsAnalyzer = lazy(() => import("./components/OptionsAnalyzer"));
+const OptionsAnalyzerV2 = lazy(() => import("./components/OptionsAnalyzerV2"));
+const InterestCalculator = lazy(() => import("./components/InterestCalculator"));
+const TradeLinks = lazy(() => import("./components/TradeLinks"));
+const WeeklyStraddleRoll = lazy(() => import("./components/WeeklyStraddleRoll"));
+const StraddleRolling = lazy(() => import("./components/StraddleRolling"));
+const PutCalendarSpreadRoll = lazy(() => import("./components/PutCalendarSpreadRoll"));
+const CallCalendarSpreadRoll = lazy(() => import("./components/CallCalendarSpreadRoll"));
+const LocalFullScreenCharts = lazy(() => import("./components/LocalFullScreenCharts"));
 
 const App: React.FC = () => {
   // Backtest state
   const [result, setResult] = useState<BacktestResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState("backtest");
+  const [activeTab, setActiveTab] = useState("trade-links");
+  const [dbStatusOpen, setDbStatusOpen] = useState(false);
+  const [dbStatusLoading, setDbStatusLoading] = useState(false);
+  const [dbStatus, setDbStatus] = useState<{
+    sqliteEntries: number;
+    sqliteApproxKb: number;
+    localStorageKeys: number;
+    localStorageApproxKb: number;
+    sqliteReads: number;
+    sqliteWrites: number;
+    sqliteRemoves: number;
+    sqliteListReads: number;
+    sqliteMigrationsAttempted: number;
+    sqliteMigrationsApplied: number;
+    sqliteLastOperationAt: string | null;
+    sampleKeys: string[];
+    checkedAt: string;
+  } | null>(null);
+
+  /** Export a full local snapshot as JSON, including SQLite-backed data */
+  const handleDownloadLocalStorage = async () => {
+    const storageSnapshot: Record<string, unknown> = {};
+    const sqliteSnapshot: Record<string, unknown> = {};
+
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key) {
+        continue;
+      }
+
+      const rawValue = localStorage.getItem(key);
+      if (rawValue === null) {
+        continue;
+      }
+
+      try {
+        storageSnapshot[key] = JSON.parse(rawValue);
+      } catch {
+        storageSnapshot[key] = rawValue;
+      }
+    }
+
+    const sqliteEntries = await getAllSqliteEntries();
+    Object.entries(sqliteEntries).forEach(([key, rawValue]) => {
+      try {
+        sqliteSnapshot[key] = JSON.parse(rawValue);
+      } catch {
+        sqliteSnapshot[key] = rawValue;
+      }
+    });
+
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      source: "browser-local-data",
+      data: {
+        localStorage: storageSnapshot,
+        sqlite: sqliteSnapshot,
+      },
+    };
+
+    const fileName = `local-data-export-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleOpenDbStatus = async () => {
+    setDbStatusOpen(true);
+    setDbStatusLoading(true);
+
+    try {
+      const sqliteEntries = await getAllSqliteEntries();
+      const sqliteMetrics = getSqliteMetrics();
+      const sqliteValues = Object.values(sqliteEntries);
+      const sqliteApproxBytes = sqliteValues.reduce((sum, value) => sum + value.length, 0);
+
+      const localValues: string[] = [];
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const key = localStorage.key(i);
+        if (!key) continue;
+        const rawValue = localStorage.getItem(key);
+        if (rawValue !== null) {
+          localValues.push(rawValue);
+        }
+      }
+
+      const localApproxBytes = localValues.reduce((sum, value) => sum + value.length, 0);
+
+      setDbStatus({
+        sqliteEntries: Object.keys(sqliteEntries).length,
+        sqliteApproxKb: Number((sqliteApproxBytes / 1024).toFixed(2)),
+        localStorageKeys: localStorage.length,
+        localStorageApproxKb: Number((localApproxBytes / 1024).toFixed(2)),
+        sqliteReads: sqliteMetrics.reads,
+        sqliteWrites: sqliteMetrics.writes,
+        sqliteRemoves: sqliteMetrics.removes,
+        sqliteListReads: sqliteMetrics.listReads,
+        sqliteMigrationsAttempted: sqliteMetrics.migrationsAttempted,
+        sqliteMigrationsApplied: sqliteMetrics.migrationsApplied,
+        sqliteLastOperationAt: sqliteMetrics.lastOperationAt,
+        sampleKeys: Object.keys(sqliteEntries).slice(0, 8),
+        checkedAt: new Date().toISOString(),
+      });
+    } catch {
+      setDbStatus(null);
+    } finally {
+      setDbStatusLoading(false);
+    }
+  };
 
   /** Trigger a backtest via the API and store the result */
   const handleRun = async (req: BacktestRequest) => {
@@ -79,6 +195,15 @@ const App: React.FC = () => {
             activeKey={activeTab}
             onChange={setActiveTab}
             items={[
+              {
+                key: "trade-links",
+                label: "Trade",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <TradeLinks />
+                  </Suspense>
+                ),
+              },
               {
                 key: "backtest",
                 label: "Backtest",
@@ -129,57 +254,94 @@ const App: React.FC = () => {
               {
                 key: "options-analyzer",
                 label: "Options Analyzer",
-                children: <OptionsAnalyzer />,
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <OptionsAnalyzer />
+                  </Suspense>
+                ),
               },
               {
                 key: "options-analyser-v2",
                 label: "Option Analyser V2",
-                children: <OptionsAnalyzerV2 />,
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <OptionsAnalyzerV2 />
+                  </Suspense>
+                ),
               },
               {
                 key: "interest-calculator",
                 label: "Interest Calculator",
-                children: <InterestCalculator />,
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <InterestCalculator />
+                  </Suspense>
+                ),
               },
-                {
+              {
                 key: "weekly-straddle-roll",
                 label: "Weekly Straddle Roll",
-                children: <WeeklyStraddleRoll />,
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <WeeklyStraddleRoll onOpenChartsTab={() => setActiveTab("local-full-screen-charts")} />
+                  </Suspense>
+                ),
               },
-              {
-                key: "covered-call",
-                label: "Covered Call",
-                children: <CoveredCall />,
-              },
-              {
-                key: "covered-put",
-                label: "Covered Put",
-                children: <CoveredPut />,
-              },
-              {
-                key: "put-calendar",
-                label: "Put Calendar",
-                children: <PutCalendar />,
-              },
-              {
-                key: "call-calendar",
-                label: "Call Calendar",
-                children: <CallCalendar />,
-              },
+              // {
+              //   key: "covered-call",
+              //   label: "Covered Call",
+              //   children: <CoveredCall />,
+              // },
+              // {
+              //   key: "covered-put",
+              //   label: "Covered Put",
+              //   children: <CoveredPut />,
+              // },
+              // {
+              //   key: "put-calendar",
+              //   label: "Put Calendar",
+              //   children: <PutCalendar />,
+              // },
+              // {
+              //   key: "call-calendar",
+              //   label: "Call Calendar",
+              //   children: <CallCalendar />,
+              // },
               {
                 key: "straddle-rolling",
                 label: "Straddle Rolling",
-                children: <StraddleRolling />,
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <StraddleRolling />
+                  </Suspense>
+                ),
               },
               {
                 key: "put-calendar-spread-roll",
                 label: "Put Calendar Spread Roll",
-                children: <PutCalendarSpreadRoll />,
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <PutCalendarSpreadRoll />
+                  </Suspense>
+                ),
               },
               {
                 key: "call-calendar-spread-roll",
                 label: "Call Calendar Spread Roll",
-                children: <CallCalendarSpreadRoll />,
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <CallCalendarSpreadRoll />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "local-full-screen-charts",
+                label: "Static Data Charts",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <LocalFullScreenCharts />
+                  </Suspense>
+                ),
               },
             
             ]}
@@ -189,6 +351,59 @@ const App: React.FC = () => {
         <Footer style={{ textAlign: "center" }}>
           Backtesting Dashboard · Built with FastAPI + React + Ant Design
         </Footer>
+
+        <Space
+          direction="vertical"
+          size={8}
+          style={{
+            position: "fixed",
+            right: 24,
+            bottom: 24,
+            zIndex: 1000,
+          }}
+        >
+          <Button onClick={handleOpenDbStatus} loading={dbStatusLoading}>
+            DB Status
+          </Button>
+          <Button
+            type="primary"
+            icon={<DownloadOutlined />}
+            onClick={handleDownloadLocalStorage}
+          >
+            Download Local Data
+          </Button>
+        </Space>
+
+        <Modal
+          title="Local DB Status"
+          open={dbStatusOpen}
+          onCancel={() => setDbStatusOpen(false)}
+          footer={null}
+        >
+          {dbStatusLoading ? (
+            <Spin />
+          ) : dbStatus ? (
+            <Descriptions size="small" column={1} bordered>
+              <Descriptions.Item label="SQLite Entries">{dbStatus.sqliteEntries}</Descriptions.Item>
+              <Descriptions.Item label="SQLite Approx Size">{dbStatus.sqliteApproxKb} KB</Descriptions.Item>
+              <Descriptions.Item label="SQLite Reads">{dbStatus.sqliteReads}</Descriptions.Item>
+              <Descriptions.Item label="SQLite Writes">{dbStatus.sqliteWrites}</Descriptions.Item>
+              <Descriptions.Item label="SQLite Removes">{dbStatus.sqliteRemoves}</Descriptions.Item>
+              <Descriptions.Item label="SQLite List Reads">{dbStatus.sqliteListReads}</Descriptions.Item>
+              <Descriptions.Item label="Migrations Attempted">{dbStatus.sqliteMigrationsAttempted}</Descriptions.Item>
+              <Descriptions.Item label="Migrations Applied">{dbStatus.sqliteMigrationsApplied}</Descriptions.Item>
+              <Descriptions.Item label="SQLite Last Operation">{dbStatus.sqliteLastOperationAt ?? "-"}</Descriptions.Item>
+              <Descriptions.Item label="localStorage Keys">{dbStatus.localStorageKeys}</Descriptions.Item>
+              <Descriptions.Item label="localStorage Approx Size">{dbStatus.localStorageApproxKb} KB</Descriptions.Item>
+              <Descriptions.Item label="Checked At">{dbStatus.checkedAt}</Descriptions.Item>
+              <Descriptions.Item label="SQLite Sample Keys">
+                {dbStatus.sampleKeys.length > 0 ? dbStatus.sampleKeys.join(", ") : "No keys found"}
+              </Descriptions.Item>
+            </Descriptions>
+          ) : (
+            <Alert type="warning" showIcon message="Could not load DB status" />
+          )}
+        </Modal>
       </Layout>
     </ConfigProvider>
   );

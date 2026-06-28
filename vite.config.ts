@@ -19,6 +19,22 @@ export default defineConfig({
   // https://<owner>.github.io from a non-<owner>.github.io repository.
   base: process.env.VITE_BASE_PATH ?? defaultBase,
   plugins: [react()],
+  build: {
+    cssMinify: true,
+    sourcemap: false,
+    reportCompressedSize: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          if (id.includes("react")) return "vendor-react";
+          if (id.includes("antd") || id.includes("@ant-design")) return "vendor-antd";
+          if (id.includes("recharts") || id.includes("@ant-design/charts")) return "vendor-charts";
+          return "vendor";
+        },
+      },
+    },
+  },
   server: {
     // Proxy API calls to the FastAPI backend at port 8000
     proxy: {

@@ -6,9 +6,12 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.tsx";
+import { installLocalStorageSqliteBridge } from "./utils/localStorageSqliteBridge";
 
 // Minimal global reset — Ant Design provides its own baseline styles
 import "./index.css";
+
+installLocalStorageSqliteBridge();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

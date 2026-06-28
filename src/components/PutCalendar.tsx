@@ -29,8 +29,8 @@ import dayjs from "dayjs";
 import * as XLSX from "xlsx";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDates2026Json from "../assets/trading_dates_2026.json";
-import dataJson from "../assets/data.json";
 import NetValueChart from "./NetValueChart";
+import { getSessionCachedDataJson } from "../utils/sessionDataJson";
 import type {
   OptionsInput,
   OptionsAnalysisRow,
@@ -126,47 +126,6 @@ type MasterStockData = Record<string, CachedStockResponse>;
 
 const MASTER_OPTION_DATA_KEY = "masterOptionData";
 const MASTER_STOCK_DATA_KEY = "masterStockData";
-const parsedDataJson =
-  dataJson && typeof dataJson === "object" && !Array.isArray(dataJson)
-    ? (dataJson as {
-      masterOptionData?: Record<string, Partial<CachedOptionResponse>>;
-      masterStockData?: Record<string, Partial<CachedStockResponse>>;
-    })
-    : {};
-
-const DATA_FILE_OPTION_DATA: MasterOptionData = Object.fromEntries(
-  Object.entries(parsedDataJson.masterOptionData ?? {}).map(([key, entry]) => [
-    key,
-    {
-      symbol: entry.symbol ?? "",
-      expiryDate: entry.expiryDate ?? "",
-      strikePrice: Number.isFinite(entry.strikePrice) ? entry.strikePrice as number : Number.NaN,
-      optionType: entry.optionType === "C" ? "C" : "P",
-      date: entry.date ?? "",
-      openPrice: entry.openPrice ?? null,
-      closePrice: entry.closePrice ?? null,
-      delta: entry.delta ?? null,
-      theta: entry.theta ?? null,
-      soldPrice: entry.soldPrice ?? null,
-      costPrice: entry.costPrice ?? null,
-      statusCode: entry.statusCode ?? null,
-      skipFuture: entry.skipFuture ?? false,
-    } satisfies CachedOptionResponse,
-  ])
-);
-
-const DATA_FILE_STOCK_DATA: MasterStockData = Object.fromEntries(
-  Object.entries(parsedDataJson.masterStockData ?? {}).map(([key, entry]) => [
-    key,
-    {
-      symbol: entry.symbol ?? "",
-      date: entry.date ?? "",
-      openPrice: entry.openPrice ?? null,
-      closePrice: entry.closePrice ?? null,
-      statusCode: entry.statusCode ?? null,
-    } satisfies CachedStockResponse,
-  ])
-);
 const tradingDates2026 = new Set<string>(tradingDates2026Json as string[]);
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
@@ -328,13 +287,13 @@ const PutCalendar: React.FC = () => {
       strikePrice,
       optionType,
       date,
-      openPrice: response.openPrice,
-      closePrice: response.closePrice,
-      delta: response.delta,
-      theta: response.theta,
+      openPrice: response.openPrice ?? null,
+      closePrice: response.closePrice ?? null,
+      delta: response.delta ?? null,
+      theta: response.theta ?? null,
       soldPrice: response.soldPrice ?? null,
       costPrice: response.costPrice ?? null,
-      statusCode: response.statusCode,
+      statusCode: response.statusCode ?? null,
       skipFuture: response.statusCode === 404,
     };
 
@@ -462,8 +421,8 @@ const PutCalendar: React.FC = () => {
                     expiryDate: formatDisplayDate(activeOptionContext.expiryDate),
                     strike: nextShortStrikePrice,
                     closePrice: nextShortClosePrice,
-                    delta: peData.delta,
-                    theta: peData.theta,
+                    delta: peData.delta ?? null,
+                    theta: peData.theta ?? null,
                     soldPrice: peData.soldPrice ?? existingShortPremium?.soldPrice ?? nextShortClosePrice,
                     costPrice: peData.costPrice ?? existingShortPremium?.costPrice ?? null,
                   }
@@ -474,8 +433,8 @@ const PutCalendar: React.FC = () => {
                     expiryDate: formatDisplayDate(activeOptionContext.longExpiryDate),
                     strike: nextLongStrikePrice,
                     closePrice: nextLongClosePrice,
-                    delta: longPeData.delta,
-                    theta: longPeData.theta,
+                    delta: longPeData.delta ?? null,
+                    theta: longPeData.theta ?? null,
                     soldPrice: longPeData.soldPrice ?? existingLongPremium?.soldPrice ?? null,
                     costPrice: longPeData.costPrice ?? existingLongPremium?.costPrice ?? nextLongClosePrice,
                   }
@@ -546,7 +505,13 @@ const PutCalendar: React.FC = () => {
         selectedOptionContext.optionType,
         selectedOptionContext.date
       );
-      setOptionDetails(response);
+      setOptionDetails({
+        openPrice: response.openPrice ?? null,
+        closePrice: response.closePrice ?? null,
+        delta: response.delta ?? null,
+        theta: response.theta ?? null,
+        statusCode: response.statusCode ?? null,
+      });
     } catch {
       message.error("Failed to fetch option details");
     } finally {
@@ -610,26 +575,24 @@ const PutCalendar: React.FC = () => {
     date: string
   ) => {
     const fileCacheKey = getCacheKey(symbol, expiryDate, strikePrice, optionType, date);
-    const optionDataFromFile = DATA_FILE_OPTION_DATA[fileCacheKey];
-    const hasOptionDataInFile =
-      Boolean(optionDataFromFile) &&
-      optionDataFromFile.statusCode !== 404 &&
-      (
-        optionDataFromFile.openPrice !== null ||
-        optionDataFromFile.closePrice !== null ||
-        optionDataFromFile.soldPrice !== null ||
-        optionDataFromFile.costPrice !== null
-      );
+    const dataJson = await getSessionCachedDataJson();
+    const optionDataFromFile = (dataJson.masterOptionData?.[fileCacheKey] as Partial<CachedOptionResponse> | null) ?? null;
+    const hasOptionDataInFile = optionDataFromFile !== null && optionDataFromFile.statusCode !== 404 && (
+      (optionDataFromFile.openPrice !== null && optionDataFromFile.openPrice !== undefined) ||
+      (optionDataFromFile.closePrice !== null && optionDataFromFile.closePrice !== undefined) ||
+      (optionDataFromFile.soldPrice !== null && optionDataFromFile.soldPrice !== undefined) ||
+      (optionDataFromFile.costPrice !== null && optionDataFromFile.costPrice !== undefined)
+    );
 
     if (hasOptionDataInFile && optionDataFromFile) {
       return {
-        openPrice: optionDataFromFile.openPrice,
-        closePrice: optionDataFromFile.closePrice,
-        delta: optionDataFromFile.delta,
-        theta: optionDataFromFile.theta,
-        soldPrice: optionDataFromFile.soldPrice,
-        costPrice: optionDataFromFile.costPrice,
-        statusCode: optionDataFromFile.statusCode,
+        openPrice: optionDataFromFile.openPrice ?? null,
+        closePrice: optionDataFromFile.closePrice ?? null,
+        delta: optionDataFromFile.delta ?? null,
+        theta: optionDataFromFile.theta ?? null,
+        soldPrice: optionDataFromFile.soldPrice ?? null,
+        costPrice: optionDataFromFile.costPrice ?? null,
+        statusCode: optionDataFromFile.statusCode ?? null,
       };
     }
 
@@ -648,19 +611,20 @@ const PutCalendar: React.FC = () => {
 
   const fetchStockWithRateLimitRetry = async (symbol: string, date: string) => {
     const stockCacheKey = `${symbol}|${date}`;
-    const stockDataFromFile = DATA_FILE_STOCK_DATA[stockCacheKey];
-    const hasStockDataInFile =
-      Boolean(stockDataFromFile) &&
-      stockDataFromFile.statusCode !== 404 &&
-      (stockDataFromFile.openPrice !== null || stockDataFromFile.closePrice !== null);
+    const dataJson = await getSessionCachedDataJson();
+    const stockDataFromFile = (dataJson.masterStockData?.[stockCacheKey] as Partial<CachedStockResponse> | null) ?? null;
+    const hasStockDataInFile = stockDataFromFile !== null && stockDataFromFile.statusCode !== 404 && (
+      (stockDataFromFile.openPrice !== null && stockDataFromFile.openPrice !== undefined) ||
+      (stockDataFromFile.closePrice !== null && stockDataFromFile.closePrice !== undefined)
+    );
 
     if (hasStockDataInFile && stockDataFromFile) {
       return {
-        openPrice: stockDataFromFile.openPrice,
-        closePrice: stockDataFromFile.closePrice,
+        openPrice: stockDataFromFile.openPrice ?? null,
+        closePrice: stockDataFromFile.closePrice ?? null,
         delta: null,
         theta: null,
-        statusCode: stockDataFromFile.statusCode,
+        statusCode: stockDataFromFile.statusCode ?? null,
       };
     }
 
@@ -1124,7 +1088,7 @@ const PutCalendar: React.FC = () => {
           sawRateLimit = true;
         }
 
-        const stockClosePrice = stockData.closePrice;
+        const stockClosePrice = stockData.closePrice ?? null;
 
         if (activeStrikePrice === null) {
           const calculatedStrikePrice = stockClosePrice !== null
@@ -1332,13 +1296,13 @@ const PutCalendar: React.FC = () => {
             strikePrice: peStrike,
             optionType: "P",
             date,
-            openPrice: peData.openPrice,
-            closePrice: pePrice,
-            delta: peData.delta,
-            theta: peData.theta,
+            openPrice: peData.openPrice ?? null,
+            closePrice: pePrice ?? null,
+            delta: peData.delta ?? null,
+            theta: peData.theta ?? null,
             soldPrice: shortSoldPrice,
             costPrice: peData.costPrice ?? null,
-            statusCode: peData.statusCode,
+            statusCode: peData.statusCode ?? null,
             skipFuture: shouldSkipPe,
           };
           cacheUpdated = true;
@@ -1351,13 +1315,13 @@ const PutCalendar: React.FC = () => {
             strikePrice: ceStrike,
             optionType: "C",
             date,
-            openPrice: longCeData.openPrice,
-            closePrice: longCePrice,
-            delta: longCeData.delta,
-            theta: longCeData.theta,
+            openPrice: longCeData.openPrice ?? null,
+            closePrice: longCePrice ?? null,
+            delta: longCeData.delta ?? null,
+            theta: longCeData.theta ?? null,
             soldPrice: longCeCached?.soldPrice ?? null,
             costPrice: longCeCached?.costPrice ?? null,
-            statusCode: longCeData.statusCode,
+            statusCode: longCeData.statusCode ?? null,
             skipFuture: shouldSkipLongCe,
           };
           cacheUpdated = true;
@@ -1372,13 +1336,13 @@ const PutCalendar: React.FC = () => {
             strikePrice: longPeStrike,
             optionType: "P",
             date,
-            openPrice: longPeData.openPrice,
-            closePrice: longPePrice,
-            delta: longPeData.delta,
-            theta: longPeData.theta,
+            openPrice: longPeData.openPrice ?? null,
+            closePrice: longPePrice ?? null,
+            delta: longPeData.delta ?? null,
+            theta: longPeData.theta ?? null,
             soldPrice: longPeData.soldPrice ?? null,
             costPrice: longCostPrice,
-            statusCode: longPeData.statusCode,
+            statusCode: longPeData.statusCode ?? null,
             skipFuture: shouldSkipLongPe,
           };
           cacheUpdated = true;
@@ -1413,43 +1377,43 @@ const PutCalendar: React.FC = () => {
           ceStrike,
           peStrike,
           cePremiumData: cePrice !== null
-            ? {
+              ? {
               expiryDate: formatDisplayDate(activeExpiryDate),
               strike: ceStrike,
               closePrice: cePrice,
-              delta: ceData.delta,
-              theta: ceData.theta,
+              delta: ceData.delta ?? null,
+              theta: ceData.theta ?? null,
             }
             : null,
           markChangeCall,
           pePremiumData: pePrice !== null
-            ? {
+              ? {
               expiryDate: formatDisplayDate(activeExpiryDate),
               strike: peStrike,
               closePrice: pePrice,
-              delta: peData.delta,
-              theta: peData.theta,
+              delta: peData.delta ?? null,
+              theta: peData.theta ?? null,
               soldPrice: peData.soldPrice ?? peCached?.soldPrice ?? pePrice,
               costPrice: peData.costPrice ?? peCached?.costPrice ?? null,
             }
             : null,
           markChangePut,
           longCePremiumData: longCePrice !== null
-            ? {
+              ? {
               expiryDate: formatDisplayDate(resolvedLongExpiryDate),
               strike: ceStrike,
               closePrice: longCePrice,
-              delta: longCeData.delta,
-              theta: longCeData.theta,
+              delta: longCeData.delta ?? null,
+              theta: longCeData.theta ?? null,
             }
             : null,
           longPePremiumData: longPePrice !== null
-            ? {
+              ? {
               expiryDate: formatDisplayDate(resolvedLongExpiryDate),
               strike: longPeStrike,
               closePrice: longPePrice,
-              delta: longPeData.delta,
-              theta: longPeData.theta,
+              delta: longPeData.delta ?? null,
+              theta: longPeData.theta ?? null,
               soldPrice: longPeData.soldPrice ?? longPeCached?.soldPrice ?? null,
               costPrice: longPeData.costPrice ?? longPeCached?.costPrice ?? longPePrice,
             }
@@ -1625,7 +1589,7 @@ const PutCalendar: React.FC = () => {
             ? { openPrice: stockCached!.openPrice, closePrice: stockCached!.closePrice, statusCode: stockCached!.statusCode }
             : await fetchStockWithRateLimitRetry(symbol, date);
 
-          const stockClosePrice = stockData.closePrice;
+          const stockClosePrice = stockData.closePrice ?? null;
 
           if (p2ActiveStrikePrice === null) {
             p2ActiveStrikePrice = stockClosePrice !== null
@@ -1685,15 +1649,15 @@ const PutCalendar: React.FC = () => {
           ]);
 
           if (!peCanUseCache && peData.statusCode !== 429) {
-            masterOptionData[peKey] = { symbol, expiryDate: expiryDateFmt, strikePrice: peStrike, optionType: "P", date, openPrice: peData.openPrice, closePrice: peData.closePrice, delta: peData.delta, theta: peData.theta, soldPrice: peData.soldPrice ?? peCached?.soldPrice ?? null, costPrice: peData.costPrice ?? null, statusCode: peData.statusCode, skipFuture: peData.statusCode === 404 };
+            masterOptionData[peKey] = { symbol, expiryDate: expiryDateFmt, strikePrice: peStrike, optionType: "P", date, openPrice: peData.openPrice ?? null, closePrice: peData.closePrice ?? null, delta: peData.delta ?? null, theta: peData.theta ?? null, soldPrice: peData.soldPrice ?? peCached?.soldPrice ?? null, costPrice: peData.costPrice ?? null, statusCode: peData.statusCode, skipFuture: peData.statusCode === 404 };
             cacheUpdated = true;
           }
           if (!longPeCanUseCache && longPeData.statusCode !== 429) {
-            masterOptionData[longPeKey] = { symbol, expiryDate: longExpiryDateFmt, strikePrice: longPeStrike, optionType: "P", date, openPrice: longPeData.openPrice, closePrice: longPeData.closePrice, delta: longPeData.delta, theta: longPeData.theta, soldPrice: longPeData.soldPrice ?? longPeCached?.soldPrice ?? null, costPrice: longPeData.costPrice ?? longPeCached?.costPrice ?? longPeData.closePrice, statusCode: longPeData.statusCode, skipFuture: longPeData.statusCode === 404 };
+            masterOptionData[longPeKey] = { symbol, expiryDate: longExpiryDateFmt, strikePrice: longPeStrike, optionType: "P", date, openPrice: longPeData.openPrice ?? null, closePrice: longPeData.closePrice ?? null, delta: longPeData.delta ?? null, theta: longPeData.theta ?? null, soldPrice: longPeData.soldPrice ?? longPeCached?.soldPrice ?? null, costPrice: longPeData.costPrice ?? longPeCached?.costPrice ?? longPeData.closePrice ?? null, statusCode: longPeData.statusCode, skipFuture: longPeData.statusCode === 404 };
             cacheUpdated = true;
           }
           if (!stockCanUseCache) {
-            masterStockData[stockKey] = { symbol, date, openPrice: stockData.openPrice, closePrice: stockData.closePrice, statusCode: stockData.statusCode };
+            masterStockData[stockKey] = { symbol, date, openPrice: stockData.openPrice ?? null, closePrice: stockData.closePrice ?? null, statusCode: stockData.statusCode ?? null };
             stockCacheUpdated = true;
           }
 

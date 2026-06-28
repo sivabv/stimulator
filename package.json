@@ -13,11 +13,13 @@
     "@ant-design/charts": "^2.6.7",
     "@ant-design/icons": "^6.2.5",
     "antd": "^6.4.4",
+    "better-sqlite3": "^12.11.1",
     "dayjs": "^1.11.21",
     "file-saver": "^2.0.5",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "recharts": "^3.8.1",
+    "sql.js": "^1.14.1",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
@@ -26,6 +28,7 @@
     "@types/node": "^24.12.3",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@types/sql.js": "^1.4.11",
     "@vitejs/plugin-react": "^6.0.1",
     "eslint": "^10.3.0",
     "eslint-plugin-react-hooks": "^7.1.1",

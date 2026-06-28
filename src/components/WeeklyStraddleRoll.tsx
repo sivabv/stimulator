@@ -1,10 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Card, Col, DatePicker, Input, InputNumber, Row, Space, Spin, Table, Tag, Typography, message } from "antd";
-import { PlayCircleOutlined, StarFilled } from "@ant-design/icons";
+import { DownloadOutlined, PlayCircleOutlined, StarFilled } from "@ant-design/icons";
 import dayjs from "dayjs";
-import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { fetchStockOpenClose, type OptionOpenClose } from "../api/backtest";
-import cachedData from "../assets/data.json";
+import spyClosingData from "../assets/spy-closing.json";
+import { getAllSqliteEntries, getSqliteItem, setSqliteItem } from "../utils/sqliteStorage";
 
 const { Text } = Typography;
 
@@ -22,21 +21,30 @@ interface WeeklyStraddleLeg {
   rolledCount: number;
   status: LegStatus;
   closeDate: string | null;
+  entryPrice: number | null;
+  entryOptionClosePrice: number | null;
+  closeOptionClosePrice: number | null;
 }
 
-interface CachedStockPrice extends OptionOpenClose {
+interface LocalPricePoint {
+  openPrice: number | null;
+  closePrice: number | null;
+  delta: number | null;
+  theta: number | null;
+  statusCode: number | null;
+}
+
+interface CachedOptionPrice extends LocalPricePoint {
   symbol: string;
+  expiryDate: string;
+  strikePrice: number;
+  optionType: "C" | "P";
   date: string;
 }
 
-interface DataFileStockPrice {
+interface CachedStockPrice extends LocalPricePoint {
   symbol: string;
   date: string;
-  openPrice?: number | null;
-  closePrice?: number | null;
-  delta?: number | null;
-  theta?: number | null;
-  statusCode?: number | null;
 }
 
 interface DailySummaryRow {
@@ -61,47 +69,27 @@ interface WeeklyStraddleRunSnapshot {
   legs: WeeklyStraddleLeg[];
 }
 
+interface WeeklyStraddleRollProps {
+  onOpenChartsTab?: () => void;
+}
+
 type MasterStockData = Record<string, CachedStockPrice>;
+type MasterOptionData = Record<string, CachedOptionPrice>;
 
 const MASTER_STOCK_DATA_KEY = "masterStockData";
+const MASTER_OPTION_DATA_KEY = "masterOptionData";
 const WEEKLY_STRADDLE_RUN_DATA_KEY = "weeklyStraddleRunData";
-const RATE_LIMIT_WAIT_MS = 65_000;
-const MAX_RATE_LIMIT_RETRIES = 3;
-const SPY_CLOSING_SERIES =
-  (((cachedData as { "SPY-closing"?: Array<{ date: string; close: number | null }> })["SPY-closing"]) ?? []);
+const SPY_CLOSING_SERIES = spyClosingData as Array<{ date: string; close: number | null }>;
 const SPY_CLOSING_DATES = SPY_CLOSING_SERIES.map((point) => point.date);
 const SPY_CLOSING_BY_DATE = new Map(SPY_CLOSING_SERIES.map((point) => [point.date, point.close]));
-const RAW_DATA_FILE_STOCK_DATA =
-  ((cachedData as unknown as { masterStockData?: Record<string, DataFileStockPrice> }).masterStockData ?? {});
-const DATA_FILE_STOCK_DATA: MasterStockData = Object.fromEntries(
-  Object.entries(RAW_DATA_FILE_STOCK_DATA).map(([key, value]) => [
-    key,
-    {
-      symbol: value.symbol,
-      date: value.date,
-      openPrice: value.openPrice ?? null,
-      closePrice: value.closePrice ?? null,
-      delta: value.delta ?? null,
-      theta: value.theta ?? null,
-      statusCode: value.statusCode ?? 200,
-    } satisfies CachedStockPrice,
-  ])
-);
-const LOCAL_STOCK_DATES_BY_SYMBOL = Object.entries(DATA_FILE_STOCK_DATA).reduce<Record<string, string[]>>(
-  (acc, [cacheKey, value]) => {
-    const [symbol, date] = cacheKey.split("|");
-    if (!symbol || !date) return acc;
-    if (value?.closePrice === null || value?.closePrice === undefined) return acc;
-    if (!acc[symbol]) acc[symbol] = [];
-    acc[symbol].push(date);
-    return acc;
-  },
-  {}
-);
-Object.values(LOCAL_STOCK_DATES_BY_SYMBOL).forEach((dates) => dates.sort());
-const DEFAULT_START_DATE = SPY_CLOSING_SERIES[0]?.date ?? "2025-01-02";
-const DEFAULT_SIMULATION_DAYS = 125;
+const DEFAULT_START_DATE = SPY_CLOSING_DATES[0] ?? "2025-01-01";
+const DEFAULT_SIMULATION_DAYS = 50;
 const TRADING_DAYS_PER_PHASE = 5;
+const DEFAULT_CALL_STRIKE_PERCENT_ABOVE = 1;
+const DEFAULT_PUT_STRIKE_PERCENT_BELOW = 1;
+const DEFAULT_DTE_MIN_DAYS = 1;
+const DEFAULT_DTE_MAX_DAYS = 4;
+const DEFAULT_DTE_TARGET_DAYS = 4;
 
 const isBusinessDay = (date: string) => {
   const dayOfWeek = dayjs(date).day();
@@ -142,6 +130,15 @@ const renderTileTitle = (legType: LegType, weekNumber: number, startDate: string
 );
 
 const getCacheKey = (symbol: string, date: string) => `${symbol}|${date}`;
+const getOptionCacheKey = (
+  symbol: string,
+  expiryDate: string,
+  strikePrice: number,
+  optionType: "C" | "P",
+  date: string
+) => `${symbol}|${expiryDate}|${strikePrice}|${optionType}|${date}`;
+
+const formatExpiryDate = (dateStr: string): string => dayjs(dateStr).format("YYMMDD");
 
 const getFirstTradingDateOnOrAfter = (date: string): string | null => getFirstBusinessDayOnOrAfter(date);
 
@@ -167,15 +164,6 @@ const getAllTradingDatesInRange = (start: string, end: string, symbol: string): 
 
   if (symbol === "SPY" && SPY_CLOSING_DATES.length > 0) {
     return SPY_CLOSING_DATES.filter(
-      (date) =>
-        (dayjs(date).isSame(dayjs(normalizedStart), "day") || dayjs(date).isAfter(dayjs(normalizedStart), "day")) &&
-        (dayjs(date).isSame(dayjs(end), "day") || dayjs(date).isBefore(dayjs(end), "day"))
-    );
-  }
-
-  const localDates = LOCAL_STOCK_DATES_BY_SYMBOL[symbol] ?? [];
-  if (localDates.length > 0) {
-    return localDates.filter(
       (date) =>
         (dayjs(date).isSame(dayjs(normalizedStart), "day") || dayjs(date).isAfter(dayjs(normalizedStart), "day")) &&
         (dayjs(date).isSame(dayjs(end), "day") || dayjs(date).isBefore(dayjs(end), "day"))
@@ -211,16 +199,6 @@ const getTradingDatesFromStart = (start: string, symbol: string, tradingDays: nu
     return SPY_CLOSING_DATES.slice(startIndex, startIndex + totalDays);
   }
 
-  const localDates = LOCAL_STOCK_DATES_BY_SYMBOL[symbol] ?? [];
-  if (localDates.length > 0) {
-    const startIndex = localDates.findIndex(
-      (date) => dayjs(date).isSame(dayjs(normalizedStart), "day") || dayjs(date).isAfter(dayjs(normalizedStart), "day")
-    );
-
-    if (startIndex === -1) return [];
-    return localDates.slice(startIndex, startIndex + totalDays);
-  }
-
   const dates = [normalizedStart];
   let currentDate = normalizedStart;
 
@@ -239,52 +217,130 @@ const getSimulationEndDate = (date: string, simulationDays: number, symbol: stri
   return tradingDates[tradingDates.length - 1] ?? "";
 };
 
-const DEFAULT_END_DATE = getSimulationEndDate(DEFAULT_START_DATE, DEFAULT_SIMULATION_DAYS, "SPY");
+const getExpiryDateInDteWindow = (
+  entryDate: string,
+  symbol: string,
+  minDteDays: number,
+  maxDteDays: number,
+  targetDteDays: number
+): string => {
+  const windowStart = dayjs(entryDate).add(minDteDays, "day").format("YYYY-MM-DD");
+  const windowEnd = dayjs(entryDate).add(maxDteDays, "day").format("YYYY-MM-DD");
+  const targetDate = dayjs(entryDate).add(targetDteDays, "day");
+  const candidates = getAllTradingDatesInRange(windowStart, windowEnd, symbol);
 
-const loadMasterStockData = (): MasterStockData => {
+  if (candidates.length === 0) {
+    return getNextTradingDate(entryDate) ?? entryDate;
+  }
+
+  return candidates.reduce((best, candidate) => {
+    const bestDistance = Math.abs(dayjs(best).diff(targetDate, "day"));
+    const candidateDistance = Math.abs(dayjs(candidate).diff(targetDate, "day"));
+    return candidateDistance < bestDistance ? candidate : best;
+  }, candidates[0]);
+};
+
+const parseMasterStockData = (raw: string | null): MasterStockData => {
+  if (!raw) return {};
+
   try {
-    const raw = localStorage.getItem(MASTER_STOCK_DATA_KEY);
-    if (!raw) return { ...DATA_FILE_STOCK_DATA };
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ...DATA_FILE_STOCK_DATA };
-    return {
-      ...DATA_FILE_STOCK_DATA,
-      ...(parsed as MasterStockData),
-    };
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as MasterStockData;
   } catch {
-    return { ...DATA_FILE_STOCK_DATA };
+    return {};
   }
 };
 
-const saveMasterStockData = (data: MasterStockData) => {
-  localStorage.setItem(MASTER_STOCK_DATA_KEY, JSON.stringify(data));
-};
+const parseMasterOptionData = (raw: string | null): MasterOptionData => {
+  if (!raw) return {};
 
-const saveWeeklyStraddleRunData = (data: WeeklyStraddleRunSnapshot) => {
-  localStorage.setItem(WEEKLY_STRADDLE_RUN_DATA_KEY, JSON.stringify(data));
-};
-
-const loadWeeklyStraddleRunData = (): WeeklyStraddleRunSnapshot | null => {
   try {
-    const raw = localStorage.getItem(WEEKLY_STRADDLE_RUN_DATA_KEY);
-    if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    return parsed as WeeklyStraddleRunSnapshot;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as MasterOptionData;
+  } catch {
+    return {};
+  }
+};
+
+const parseWeeklyStraddleRunSnapshot = (raw: string | null): WeeklyStraddleRunSnapshot | null => {
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as WeeklyStraddleRunSnapshot;
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.legs) || !parsed.closingPriceByDate) {
+      return null;
+    }
+
+    return parsed;
   } catch {
     return null;
   }
 };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const loadWeeklyStraddleRunData = async (): Promise<WeeklyStraddleRunSnapshot | null> => {
+  const sqliteRaw = await getSqliteItem(WEEKLY_STRADDLE_RUN_DATA_KEY);
+  return parseWeeklyStraddleRunSnapshot(sqliteRaw);
+};
 
-const WeeklyStraddleRoll: React.FC = () => {
-  const [startDate, setStartDate] = useState(DEFAULT_START_DATE);
-  const [endDate, setEndDate] = useState(DEFAULT_END_DATE);
-  const [simulationDays, setSimulationDays] = useState(DEFAULT_SIMULATION_DAYS);
-  const [activeDateFilter, setActiveDateFilter] = useState("");
+const saveWeeklyStraddleRunData = async (data: WeeklyStraddleRunSnapshot) => {
+  const payload = JSON.stringify(data);
+  await setSqliteItem(WEEKLY_STRADDLE_RUN_DATA_KEY, payload);
+};
+
+const exportStaticDataToFile = async () => {
+  const staticDataKeys = [MASTER_STOCK_DATA_KEY, MASTER_OPTION_DATA_KEY, WEEKLY_STRADDLE_RUN_DATA_KEY] as const;
+  const sqliteEntries = await getAllSqliteEntries();
+  const data: Record<string, unknown> = {};
+
+  staticDataKeys.forEach((key) => {
+    const raw = sqliteEntries[key] ?? null;
+
+    try {
+      if (!raw) return;
+      data[key] = JSON.parse(raw);
+    } catch {
+      data[key] = raw;
+    }
+  });
+
+  const payload = {
+    exportedAt: dayjs().toISOString(),
+    source: "weekly-straddle-static-data-sqlite",
+    keys: staticDataKeys,
+    data,
+  };
+
+  const fileName = `weekly-straddle-static-data-${dayjs().format("YYYY-MM-DD-HHmmss")}.json`;
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  message.success("Exported static data from SQLite/local cache");
+};
+
+const WeeklyStraddleRoll: React.FC<WeeklyStraddleRollProps> = ({ onOpenChartsTab }) => {
   const [stockTicker, setStockTicker] = useState("SPY");
+  const [startDate, setStartDate] = useState(DEFAULT_START_DATE);
+  const [simulationDays, setSimulationDays] = useState(DEFAULT_SIMULATION_DAYS);
+  const [endDate, setEndDate] = useState(getSimulationEndDate(DEFAULT_START_DATE, DEFAULT_SIMULATION_DAYS, "SPY"));
+  const [callStrikePercentAboveInput, setCallStrikePercentAboveInput] = useState<number | null>(null);
+  const [putStrikePercentBelowInput, setPutStrikePercentBelowInput] = useState<number | null>(null);
+  const [dteMinDaysInput, setDteMinDaysInput] = useState<number | null>(null);
+  const [dteMaxDaysInput, setDteMaxDaysInput] = useState<number | null>(null);
+  const [dteTargetDaysInput, setDteTargetDaysInput] = useState<number | null>(null);
+  const [activeDateFilter, setActiveDateFilter] = useState("");
   const [loading, setLoading] = useState(false);
+  const [showSummary, setShowSummary] = useState(false);
+  const [legs, setLegs] = useState<WeeklyStraddleLeg[]>([]);
+  const [closingPriceByDate, setClosingPriceByDate] = useState<Record<string, number | null>>({});
   const [runProgress, setRunProgress] = useState<{ processed: number; total: number; phase: number; totalPhases: number }>({
     processed: 0,
     total: 0,
@@ -292,54 +348,32 @@ const WeeklyStraddleRoll: React.FC = () => {
     totalPhases: 0,
   });
   const [error, setError] = useState<string | null>(null);
-  const [legs, setLegs] = useState<WeeklyStraddleLeg[]>([]);
-  const [closingPriceByDate, setClosingPriceByDate] = useState<Record<string, number | null>>({});
-  const masterStockDataRef = useRef<MasterStockData>(loadMasterStockData());
+  const masterStockDataRef = useRef<MasterStockData>({});
+  const masterOptionDataRef = useRef<MasterOptionData>({});
   const pendingStockRequestsRef = useRef<Record<string, Promise<CachedStockPrice>>>({});
+  const pendingOptionRequestsRef = useRef<Record<string, Promise<CachedOptionPrice>>>({});
+  const restoredRunRef = useRef(false);
 
   useEffect(() => {
-    const savedRun = loadWeeklyStraddleRunData();
-    if (!savedRun) return;
+    let cancelled = false;
 
-    const restoredSymbol = savedRun.symbol || "SPY";
-    const restoredStartDate = savedRun.startDate || DEFAULT_START_DATE;
+    const loadMasterCaches = async () => {
+      const [stockRaw, optionRaw] = await Promise.all([
+        getSqliteItem(MASTER_STOCK_DATA_KEY),
+        getSqliteItem(MASTER_OPTION_DATA_KEY),
+      ]);
 
-    setStockTicker(restoredSymbol);
-    setStartDate(restoredStartDate);
-    setSimulationDays(DEFAULT_SIMULATION_DAYS);
-    setEndDate(getSimulationEndDate(restoredStartDate, DEFAULT_SIMULATION_DAYS, restoredSymbol));
-    setClosingPriceByDate(savedRun.closingPriceByDate ?? {});
-    setLegs(savedRun.legs ?? []);
+      if (cancelled) return;
+      masterStockDataRef.current = parseMasterStockData(stockRaw);
+      masterOptionDataRef.current = parseMasterOptionData(optionRaw);
+    };
 
-    const restoredTradeCount = Math.max(0, Math.floor((savedRun.legs?.length ?? 0) / 2));
-    const restoredTotalPhases = Math.max(1, Math.ceil(restoredTradeCount / TRADING_DAYS_PER_PHASE));
-    setRunProgress({
-      processed: restoredTradeCount,
-      total: restoredTradeCount,
-      phase: restoredTotalPhases,
-      totalPhases: restoredTotalPhases,
-    });
+    void loadMasterCaches();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
-
-  const fetchWithRateLimitRetry = async <T extends { statusCode: number | null }>(
-    work: () => Promise<T>,
-    options?: { stopOnRateLimit?: boolean }
-  ) => {
-    let response = await work();
-
-    if (response.statusCode === 429 && options?.stopOnRateLimit) {
-      throw new Error("Rate limit hit (429). Run stopped. Please wait and try again.");
-    }
-
-    let attempts = 0;
-    while (response.statusCode === 429 && attempts < MAX_RATE_LIMIT_RETRIES) {
-      attempts += 1;
-      message.warning(`Rate limit hit (429). Waiting ${RATE_LIMIT_WAIT_MS / 1000} seconds before retry ${attempts}.`);
-      await sleep(RATE_LIMIT_WAIT_MS);
-      response = await work();
-    }
-    return response;
-  };
 
   const fetchStockWithCache = async (symbol: string, date: string): Promise<CachedStockPrice> => {
     const cacheKey = getCacheKey(symbol, date);
@@ -363,60 +397,96 @@ const WeeklyStraddleRoll: React.FC = () => {
       }
     }
 
-    // If this symbol exists in bundled local data, avoid external calls and rely only on local coverage.
-    const hasLocalSymbolCoverage = Boolean(LOCAL_STOCK_DATES_BY_SYMBOL[symbol]?.length);
-    if (hasLocalSymbolCoverage) {
-      return {
-        symbol,
-        date,
-        openPrice: null,
-        closePrice: null,
-        delta: null,
-        theta: null,
-        statusCode: 200,
-      };
-    }
-
     const pending = pendingStockRequestsRef.current[cacheKey];
     if (pending) return pending;
 
-    const request = (async () => {
-      try {
-        const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(symbol, date), {
-          stopOnRateLimit: true,
-        });
+    const localOnlyResult: CachedStockPrice = {
+      symbol,
+      date,
+      openPrice: null,
+      closePrice: null,
+      delta: null,
+      theta: null,
+      statusCode: 204,
+    };
 
-        if (stockData.statusCode === 429) {
-          throw new Error("Rate limit was hit repeatedly while fetching stock prices. Please wait a minute and try again.");
-        }
-
-        if (stockData.statusCode === null) {
-          throw new Error("Stock price service is unavailable right now. Please retry shortly.");
-        }
-
-        const result: CachedStockPrice = { symbol, date, ...stockData };
-
-        if (stockData.statusCode >= 200 && stockData.statusCode < 300 && stockData.closePrice !== null) {
-          masterStockDataRef.current[cacheKey] = result;
-          saveMasterStockData(masterStockDataRef.current);
-        }
-
-        return result;
-      } finally {
-        delete pendingStockRequestsRef.current[cacheKey];
-      }
-    })();
-
-    pendingStockRequestsRef.current[cacheKey] = request;
-    return request;
+    return localOnlyResult;
   };
 
+  const fetchOptionWithCache = async (
+    symbol: string,
+    expiryDate: string,
+    strikePrice: number,
+    optionType: "C" | "P",
+    date: string
+  ): Promise<CachedOptionPrice> => {
+    const formattedExpiryDate = formatExpiryDate(expiryDate);
+    const cacheKey = getOptionCacheKey(symbol, formattedExpiryDate, strikePrice, optionType, date);
+    const cached = masterOptionDataRef.current[cacheKey];
+    if (cached) return cached;
+
+    const pending = pendingOptionRequestsRef.current[cacheKey];
+    if (pending) return pending;
+
+    const localOnlyResult: CachedOptionPrice = {
+      symbol,
+      expiryDate: formattedExpiryDate,
+      strikePrice,
+      optionType,
+      date,
+      openPrice: null,
+      closePrice: null,
+      delta: null,
+      theta: null,
+      statusCode: 204,
+    };
+
+    return localOnlyResult;
+  };
+
+  useEffect(() => {
+    if (restoredRunRef.current) return;
+    let cancelled = false;
+
+    const restore = async () => {
+      const storedRun = await loadWeeklyStraddleRunData();
+      if (!storedRun || cancelled) return;
+
+      const currentSymbol = stockTicker.trim().toUpperCase();
+      const storedSymbol = storedRun.symbol.trim().toUpperCase();
+      const normalizedStart = getFirstTradingDateOnOrAfter(startDate) ?? startDate;
+
+      if (
+        storedSymbol !== currentSymbol ||
+        storedRun.startDate !== normalizedStart ||
+        storedRun.endDate !== endDate ||
+        storedRun.tradingDays !== simulationDays
+      ) {
+        return;
+      }
+
+      restoredRunRef.current = true;
+      setClosingPriceByDate(storedRun.closingPriceByDate);
+      setLegs(storedRun.legs);
+      setLoading(false);
+      message.success("Loaded saved weekly straddle data from SQLite");
+    };
+
+    void restore();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [endDate, simulationDays, startDate, stockTicker]);
+
   const simulateLeg = async (
+    symbol: string,
     weekNumber: number,
     legType: LegType,
     entryDate: string,
     initialExpiryDate: string,
     strike: number,
+    dteConfig: { minDays: number; maxDays: number; targetDays: number },
     rangeEndDate: string
   ): Promise<WeeklyStraddleLeg> => {
     const maxMonitorDate = dayjs(rangeEndDate);
@@ -426,7 +496,15 @@ const WeeklyStraddleRoll: React.FC = () => {
     let currentDate = entryDate;
 
     while (!dayjs(currentDate).isAfter(maxMonitorDate, "day")) {
-      const stockResult = await fetchStockWithCache(stockTicker.trim().toUpperCase(), currentDate);
+      // Keep the leg active until the current expiry date is reached.
+      if (dayjs(currentDate).isBefore(dayjs(currentExpiryDate), "day")) {
+        const nextDate = getNextTradingDate(currentDate);
+        if (!nextDate) break;
+        currentDate = nextDate;
+        continue;
+      }
+
+      const stockResult = await fetchStockWithCache(symbol, currentDate);
       const closePrice = stockResult.closePrice;
 
       if (closePrice === null) {
@@ -446,7 +524,13 @@ const WeeklyStraddleRoll: React.FC = () => {
         }
 
         rolledCount += 1;
-        currentExpiryDate = nextDate;
+        currentExpiryDate = getExpiryDateInDteWindow(
+          nextDate,
+          symbol,
+          dteConfig.minDays,
+          dteConfig.maxDays,
+          dteConfig.targetDays
+        );
         currentDate = nextDate;
         continue;
       }
@@ -459,6 +543,14 @@ const WeeklyStraddleRoll: React.FC = () => {
       closeDate = currentDate;
     }
 
+    const optionType: "C" | "P" = legType === "Call" ? "C" : "P";
+    const [entryOption, closeOption] = await Promise.all([
+      fetchOptionWithCache(symbol, initialExpiryDate, strike, optionType, entryDate).catch(() => null),
+      closeDate
+        ? fetchOptionWithCache(symbol, currentExpiryDate, strike, optionType, closeDate).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+
     return {
       key: `${weekNumber}-${legType}-${entryDate}`,
       weekNumber,
@@ -470,6 +562,9 @@ const WeeklyStraddleRoll: React.FC = () => {
       rolledCount,
       status: closeDate ? "closed" : "active",
       closeDate,
+      entryPrice: entryOption?.closePrice ?? null,
+      entryOptionClosePrice: entryOption?.closePrice ?? null,
+      closeOptionClosePrice: closeOption?.closePrice ?? null,
     };
   };
 
@@ -484,6 +579,35 @@ const WeeklyStraddleRoll: React.FC = () => {
       const symbol = stockTicker.trim().toUpperCase();
       const effectiveSimulationDays = Math.max(1, Math.floor(simulationDays));
       const effectiveEndDate = getSimulationEndDate(startDate, effectiveSimulationDays, symbol);
+      const effectiveCallStrikePercentAbove =
+        typeof callStrikePercentAboveInput === "number" && Number.isFinite(callStrikePercentAboveInput) && callStrikePercentAboveInput >= 0
+          ? callStrikePercentAboveInput
+          : DEFAULT_CALL_STRIKE_PERCENT_ABOVE;
+      const effectivePutStrikePercentBelow =
+        typeof putStrikePercentBelowInput === "number" && Number.isFinite(putStrikePercentBelowInput) && putStrikePercentBelowInput >= 0
+          ? putStrikePercentBelowInput
+          : DEFAULT_PUT_STRIKE_PERCENT_BELOW;
+
+      const requestedMinDte =
+        typeof dteMinDaysInput === "number" && Number.isFinite(dteMinDaysInput) && dteMinDaysInput >= 1
+          ? Math.floor(dteMinDaysInput)
+          : DEFAULT_DTE_MIN_DAYS;
+      const requestedMaxDte =
+        typeof dteMaxDaysInput === "number" && Number.isFinite(dteMaxDaysInput) && dteMaxDaysInput >= 1
+          ? Math.floor(dteMaxDaysInput)
+          : DEFAULT_DTE_MAX_DAYS;
+      const effectiveDteMinDays = Math.min(requestedMinDte, requestedMaxDte);
+      const effectiveDteMaxDays = Math.max(requestedMinDte, requestedMaxDte);
+      const requestedTargetDte =
+        typeof dteTargetDaysInput === "number" && Number.isFinite(dteTargetDaysInput) && dteTargetDaysInput >= 1
+          ? Math.floor(dteTargetDaysInput)
+          : DEFAULT_DTE_TARGET_DAYS;
+      const effectiveDteTargetDays = Math.min(effectiveDteMaxDays, Math.max(effectiveDteMinDays, requestedTargetDte));
+      const dteConfig = {
+        minDays: effectiveDteMinDays,
+        maxDays: effectiveDteMaxDays,
+        targetDays: effectiveDteTargetDays,
+      };
 
       if (!symbol) throw new Error("Stock ticker is required");
       if (!Number.isFinite(simulationDays) || simulationDays < 1) {
@@ -512,13 +636,27 @@ const WeeklyStraddleRoll: React.FC = () => {
           const entryPrice = stockResult.closePrice;
           if (entryPrice === null) continue;
 
-          const strike = roundToNearestFive(entryPrice);
-          const initialExpiryDate = getNextTradingDate(entryDate) ?? entryDate;
+          const callStrike = roundToNearestFive(entryPrice * (1 + effectiveCallStrikePercentAbove / 100));
+          const putStrike = roundToNearestFive(entryPrice * (1 - effectivePutStrikePercentBelow / 100));
+          const callInitialExpiryDate = getExpiryDateInDteWindow(
+            entryDate,
+            symbol,
+            dteConfig.minDays,
+            dteConfig.maxDays,
+            dteConfig.targetDays
+          );
+          const putInitialExpiryDate = getExpiryDateInDteWindow(
+            entryDate,
+            symbol,
+            dteConfig.minDays,
+            dteConfig.maxDays,
+            dteConfig.targetDays
+          );
           const tradeNumber = phaseStart + offset + 1;
 
           const [callLeg, putLeg] = await Promise.all([
-            simulateLeg(tradeNumber, "Call", entryDate, initialExpiryDate, strike, effectiveEndDate),
-            simulateLeg(tradeNumber, "Put", entryDate, initialExpiryDate, strike, effectiveEndDate),
+            simulateLeg(symbol, tradeNumber, "Call", entryDate, callInitialExpiryDate, callStrike, dteConfig, effectiveEndDate),
+            simulateLeg(symbol, tradeNumber, "Put", entryDate, putInitialExpiryDate, putStrike, dteConfig, effectiveEndDate),
           ]);
 
           results.push(callLeg, putLeg);
@@ -546,7 +684,7 @@ const WeeklyStraddleRoll: React.FC = () => {
 
       setClosingPriceByDate(closingPriceSnapshot);
       setLegs(results);
-      saveWeeklyStraddleRunData({
+      void saveWeeklyStraddleRunData({
         symbol,
         startDate: firstDate,
         endDate: effectiveEndDate,
@@ -559,7 +697,7 @@ const WeeklyStraddleRoll: React.FC = () => {
       if (!results.length) {
         message.warning("No daily straddles could be generated for the selected date range");
       } else {
-        message.success("Stored weekly straddle run data as JSON in localStorage");
+        message.success("Stored weekly straddle run data in SQLite");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to run daily straddle simulation");
@@ -569,9 +707,45 @@ const WeeklyStraddleRoll: React.FC = () => {
     }
   };
 
+  const handleSaveData = () => {
+    if (legs.length === 0) {
+      message.warning("Run a simulation before saving data");
+      return;
+    }
+
+    void saveWeeklyStraddleRunData({
+      symbol: stockTicker.trim().toUpperCase(),
+      startDate,
+      endDate,
+      tradingDays: simulationDays,
+      generatedAt: dayjs().toISOString(),
+      closingPriceByDate,
+      legs,
+    });
+
+    message.success("Saved current weekly straddle data to SQLite");
+  };
+
+  useEffect(() => {
+    if (loading || legs.length === 0) return;
+
+    void saveWeeklyStraddleRunData({
+      symbol: stockTicker.trim().toUpperCase(),
+      startDate,
+      endDate,
+      tradingDays: simulationDays,
+      generatedAt: dayjs().toISOString(),
+      closingPriceByDate,
+      legs,
+    });
+  }, [closingPriceByDate, endDate, legs, loading, simulationDays, startDate, stockTicker]);
+
   const sectionData = useMemo(() => {
     if (legs.length === 0) {
-      return { summaryRows: [] as DailySummaryRow[], tiles: [] as React.ReactNode[] };
+      return {
+        summaryRows: [] as DailySummaryRow[],
+        tiles: [] as React.ReactNode[],
+      };
     }
 
     const symbol = stockTicker.trim().toUpperCase();
@@ -750,6 +924,14 @@ const WeeklyStraddleRoll: React.FC = () => {
                                 Close: {formatDate(leg.closeDate)}
                               </Text>
                             </div>
+                            <div>
+                              <Text strong>Option px: </Text>
+                              <Text>
+                                Entry {formatCurrency(leg.entryPrice)}
+                                <span style={{ margin: "0 4px" }}>|</span>
+                                Close {formatCurrency(leg.closeOptionClosePrice)}
+                              </Text>
+                            </div>
                           </Space>
                         </Card>
                       </Col>
@@ -792,6 +974,14 @@ const WeeklyStraddleRoll: React.FC = () => {
                                 Close: {formatDate(leg.closeDate)}
                               </Text>
                             </div>
+                            <div>
+                              <Text strong>Option px: </Text>
+                              <Text>
+                                Entry {formatCurrency(leg.entryPrice)}
+                                <span style={{ margin: "0 4px" }}>|</span>
+                                Close {formatCurrency(leg.closeOptionClosePrice)}
+                              </Text>
+                            </div>
                           </Space>
                         </Card>
                       </Col>
@@ -808,17 +998,6 @@ const WeeklyStraddleRoll: React.FC = () => {
     return { summaryRows, tiles };
   }, [activeDateFilter, closingPriceByDate, endDate, legs, startDate, stockTicker]);
 
-  const optionsTrendData = useMemo(
-    () =>
-      sectionData.summaryRows.map((row) => ({
-        date: row.date,
-        openedOptions: legs.filter((leg) => leg.entryDate === row.date).length,
-        closedOptions: legs.filter((leg) => leg.closeDate === row.date).length,
-        activeOptions: row.activeOptions,
-      })),
-    [sectionData.summaryRows, legs]
-  );
-
   return (
     <Space direction="vertical" size={20} style={{ width: "100%" }}>
       <Card title="Daily ATM Short Straddle Roll (Mon-Fri)">
@@ -827,7 +1006,7 @@ const WeeklyStraddleRoll: React.FC = () => {
             type="info"
             showIcon
             message="Price-free output"
-            description="Sells an ATM call and put each trading day, uses 1-trading-day expiry, rolls forward by 1 day while in the money, and runs in 5-trading-day weekly phases using cached stock data."
+            description="Sells a call above spot and a put below spot each trading day using configurable percent offsets and configurable DTE window (with defaults). Rolls while in the money across 5-trading-day weekly phases using cached stock data."
           />
 
           <Row gutter={[16, 16]}>
@@ -907,11 +1086,77 @@ const WeeklyStraddleRoll: React.FC = () => {
                 placeholder="SPY"
               />
             </Col>
+
+            <Col xs={24} md={12} lg={6}>
+              <Text>Call % Above (optional)</Text>
+              <InputNumber
+                min={0}
+                max={100}
+                value={callStrikePercentAboveInput}
+                onChange={(value) => setCallStrikePercentAboveInput(typeof value === "number" && Number.isFinite(value) ? value : null)}
+                style={{ width: "100%", marginTop: 8 }}
+                placeholder={`${DEFAULT_CALL_STRIKE_PERCENT_ABOVE}`}
+              />
+            </Col>
+
+            <Col xs={24} md={12} lg={6}>
+              <Text>Put % Below (optional)</Text>
+              <InputNumber
+                min={0}
+                max={100}
+                value={putStrikePercentBelowInput}
+                onChange={(value) => setPutStrikePercentBelowInput(typeof value === "number" && Number.isFinite(value) ? value : null)}
+                style={{ width: "100%", marginTop: 8 }}
+                placeholder={`${DEFAULT_PUT_STRIKE_PERCENT_BELOW}`}
+              />
+            </Col>
+
+            <Col xs={24} md={12} lg={6}>
+              <Text>DTE Min (optional)</Text>
+              <InputNumber
+                min={1}
+                max={365}
+                value={dteMinDaysInput}
+                onChange={(value) => setDteMinDaysInput(typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null)}
+                style={{ width: "100%", marginTop: 8 }}
+                placeholder={`${DEFAULT_DTE_MIN_DAYS}`}
+              />
+            </Col>
+
+            <Col xs={24} md={12} lg={6}>
+              <Text>DTE Max (optional)</Text>
+              <InputNumber
+                min={1}
+                max={365}
+                value={dteMaxDaysInput}
+                onChange={(value) => setDteMaxDaysInput(typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null)}
+                style={{ width: "100%", marginTop: 8 }}
+                placeholder={`${DEFAULT_DTE_MAX_DAYS}`}
+              />
+            </Col>
+
+            <Col xs={24} md={12} lg={6}>
+              <Text>DTE Target (optional)</Text>
+              <InputNumber
+                min={1}
+                max={365}
+                value={dteTargetDaysInput}
+                onChange={(value) => setDteTargetDaysInput(typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null)}
+                style={{ width: "100%", marginTop: 8 }}
+                placeholder={`${DEFAULT_DTE_TARGET_DAYS}`}
+              />
+            </Col>
           </Row>
 
           <Space>
             <Button type="primary" icon={<PlayCircleOutlined />} onClick={handleRun} loading={loading}>
               Run Daily Straddle Simulation
+            </Button>
+            <Button onClick={handleSaveData} disabled={legs.length === 0}>
+              Save Data
+            </Button>
+            <Button icon={<DownloadOutlined />} onClick={exportStaticDataToFile}>
+              Download Static Data
             </Button>
           </Space>
         </Space>
@@ -930,41 +1175,40 @@ const WeeklyStraddleRoll: React.FC = () => {
 
       {!loading && legs.length > 0 && (
         <Card title="Option Tiles">
-          <div style={{ width: "100%", height: 320, marginBottom: 16 }}>
-            <ResponsiveContainer>
-              <LineChart data={optionsTrendData} margin={{ top: 8, right: 20, left: 0, bottom: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="date" />
-                <YAxis allowDecimals={false} />
-                <Tooltip />
-                <Legend />
-                <Line type="monotone" dataKey="openedOptions" name="Opened" stroke="#1677ff" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="closedOptions" name="Closed" stroke="#ff4d4f" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="activeOptions" name="Active" stroke="#52c41a" strokeWidth={2} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-          <Table
-            rowKey="key"
-            size="small"
-            pagination={false}
-            columns={[
-              { title: "Date", dataIndex: "date", key: "date" },
-              {
-                title: "Close",
-                dataIndex: "closePrice",
-                key: "closePrice",
-                render: (value: number | null) => formatCurrency(value),
-              },
-              { title: "Shown Options", dataIndex: "shownOptions", key: "shownOptions" },
-              { title: "Active Options", dataIndex: "activeOptions", key: "activeOptions" },
-              { title: "Calls Active", dataIndex: "callsActive", key: "callsActive" },
-              { title: "Puts Active", dataIndex: "putsActive", key: "putsActive" },
-              { title: "Closed in this week", dataIndex: "closedInThisWeek", key: "closedInThisWeek" },
-              { title: "Cumulative closed", dataIndex: "cumulativeClosed", key: "cumulativeClosed" },
-            ]}
-            dataSource={sectionData.summaryRows}
-          />
+          <Space size={8} style={{ marginBottom: 12 }}>
+            <Button onClick={() => onOpenChartsTab?.()}>
+              Charts
+            </Button>
+            <Button onClick={() => setShowSummary((previous) => !previous)}>
+              {showSummary ? "Hide Summary" : "Show Summary"}
+            </Button>
+          </Space>
+
+          {showSummary && (
+            <Table
+              rowKey="key"
+              size="small"
+              pagination={false}
+              columns={[
+                { title: "Date", dataIndex: "date", key: "date" },
+                {
+                  title: "Close",
+                  dataIndex: "closePrice",
+                  key: "closePrice",
+                  render: (value: number | null) => formatCurrency(value),
+                },
+                { title: "Shown Options", dataIndex: "shownOptions", key: "shownOptions" },
+                { title: "Active Options", dataIndex: "activeOptions", key: "activeOptions" },
+                { title: "Calls Active", dataIndex: "callsActive", key: "callsActive" },
+                { title: "Puts Active", dataIndex: "putsActive", key: "putsActive" },
+                { title: "Closed in this week", dataIndex: "closedInThisWeek", key: "closedInThisWeek" },
+                { title: "Cumulative closed", dataIndex: "cumulativeClosed", key: "cumulativeClosed" },
+              ]}
+              dataSource={sectionData.summaryRows}
+              style={{ marginBottom: 16 }}
+            />
+          )}
+
           {sectionData.tiles}
         </Card>
       )}
