@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -17,7 +17,11 @@ import {
 } from "antd";
 import { PlayCircleOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
-import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
+import {
+  fetchOptionOpenClose,
+  fetchStockOpenClose,
+  type OptionOpenClose,
+} from "../api/backtest";
 import tradingDatesJson from "../assets/trading_dates_2026.json";
 
 const { Text } = Typography;
@@ -61,6 +65,31 @@ interface RollPreview {
   netCreditDebit: number | null;
 }
 
+interface PutLegModalData {
+  legType: "Short Put" | "Long Put";
+  premium: number | null;
+  expiryDate: string;
+  strike: number;
+  tradeDate: string;
+  status: RowStatus;
+}
+
+interface RollingOptionCandidate {
+  key: string;
+  expiryDate: string;
+  strike: number;
+  newShortPutPremium: number | null;
+  netCreditDebit: number | null;
+}
+
+interface PauseCheckpointData {
+  processedCount: number;
+  date: string;
+  rollNumber: number;
+  closingPrice: number | null;
+  cumulativePnl: number | null;
+}
+
 type MasterStockData = Record<string, CachedStockPrice>;
 
 const RATE_LIMIT_WAIT_MS = 2_000;
@@ -72,6 +101,7 @@ const LONG_EXPIRY_MIN_DTE_DAYS = 150;
 const LONG_EXPIRY_MAX_DTE_DAYS = 400;
 const MIN_AUTO_ROLL_CREDIT = 1.25;
 const AUTO_ROLL_MAX_STRIKE_STEPS = 8;
+const AUTO_PAUSE_EVERY_SIMULATIONS = 5;
 
 const tradingDates = (tradingDatesJson as string[])
   .filter((value) => dayjs(value).isValid())
@@ -161,6 +191,13 @@ const getExpiryDateCandidatesInDteWindow = (
 };
 
 const getCacheKey = (symbol: string, date: string) => `${symbol}|${date}`;
+const getOptionCacheKey = (
+  symbol: string,
+  expiryDate: string,
+  strikePrice: number,
+  optionType: "C" | "P",
+  date: string
+) => `${symbol}|${expiryDate}|${strikePrice}|${optionType}|${date}`;
 
 const loadMasterStockData = (): MasterStockData => {
   try {
@@ -180,10 +217,10 @@ const saveMasterStockData = (data: MasterStockData) => {
 
 const PutCalendarSpreadRoll: React.FC = () => {
   const [startDate, setStartDate] = useState("2025-01-02");
-  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("");
-  const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("");
+  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("2025-01-31");
+  const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("2025-12-19");
   const [stockTicker, setStockTicker] = useState("SPY");
-  const [autoRollWeeklyEnabled, setAutoRollWeeklyEnabled] = useState(true);
+  const [autoRollWeeklyEnabled, setAutoRollWeeklyEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<PutCalendarRow[]>([]);
@@ -195,6 +232,14 @@ const PutCalendarSpreadRoll: React.FC = () => {
   const [rollStrike, setRollStrike] = useState<number>(0);
   const [rollPreview, setRollPreview] = useState<RollPreview | null>(null);
   const [rollPreviewLoading, setRollPreviewLoading] = useState(false);
+  const [putLegModalOpen, setPutLegModalOpen] = useState(false);
+  const [putLegModalData, setPutLegModalData] = useState<PutLegModalData | null>(null);
+  const [rollingOptionsLoading, setRollingOptionsLoading] = useState(false);
+  const [rollingOptions, setRollingOptions] = useState<RollingOptionCandidate[]>([]);
+  const [isPaused, setIsPaused] = useState(false);
+  const [processedSimulationCount, setProcessedSimulationCount] = useState(0);
+  const [pausePromptOpen, setPausePromptOpen] = useState(false);
+  const [pauseCheckpointData, setPauseCheckpointData] = useState<PauseCheckpointData | null>(null);
 
   const [summary, setSummary] = useState<{
     startDate: string;
@@ -207,6 +252,37 @@ const PutCalendarSpreadRoll: React.FC = () => {
     optionStrategyReturn: number;
     optionStrategyReturnPct: number | null;
   } | null>(null);
+
+  const stockCacheRef = useRef<MasterStockData>(loadMasterStockData());
+  const stockInFlightRef = useRef<Map<string, Promise<CachedStockPrice>>>(new Map());
+  const optionCacheRef = useRef<Record<string, OptionOpenClose>>({});
+  const optionInFlightRef = useRef<Map<string, Promise<OptionOpenClose>>>(new Map());
+  const pauseDecisionResolverRef = useRef<((shouldContinue: boolean) => void) | null>(null);
+  const manualPauseRequestedRef = useRef(false);
+
+  const setPauseState = (value: boolean) => {
+    setIsPaused(value);
+  };
+
+  const openPausePrompt = (checkpointData: PauseCheckpointData): Promise<boolean> => {
+    setPauseCheckpointData(checkpointData);
+    setPausePromptOpen(true);
+    setPauseState(true);
+
+    return new Promise<boolean>((resolve) => {
+      pauseDecisionResolverRef.current = resolve;
+    });
+  };
+
+  const resolvePauseDecision = (shouldContinue: boolean) => {
+    setPausePromptOpen(false);
+    setPauseState(false);
+    manualPauseRequestedRef.current = false;
+    if (pauseDecisionResolverRef.current) {
+      pauseDecisionResolverRef.current(shouldContinue);
+      pauseDecisionResolverRef.current = null;
+    }
+  };
 
   const fetchWithRateLimitRetry = async <T extends { statusCode: number | null }>(
     work: () => Promise<T>
@@ -223,16 +299,59 @@ const PutCalendarSpreadRoll: React.FC = () => {
   };
 
   const fetchStockWithCache = async (symbol: string, date: string): Promise<CachedStockPrice> => {
-    const masterData = loadMasterStockData();
     const cacheKey = getCacheKey(symbol, date);
-    const cached = masterData[cacheKey];
+    const cached = stockCacheRef.current[cacheKey];
     if (cached) return cached;
 
-    const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(symbol, date));
-    const result: CachedStockPrice = { symbol, date, closePrice: stockData.closePrice };
-    masterData[cacheKey] = result;
-    saveMasterStockData(masterData);
-    return result;
+    const pending = stockInFlightRef.current.get(cacheKey);
+    if (pending) return pending;
+
+    const request = (async () => {
+      const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(symbol, date));
+      const result: CachedStockPrice = { symbol, date, closePrice: stockData.closePrice };
+      stockCacheRef.current[cacheKey] = result;
+      saveMasterStockData(stockCacheRef.current);
+      return result;
+    })();
+
+    stockInFlightRef.current.set(cacheKey, request);
+
+    try {
+      return await request;
+    } finally {
+      stockInFlightRef.current.delete(cacheKey);
+    }
+  };
+
+  const fetchOptionWithCache = async (
+    symbol: string,
+    expiryDate: string,
+    strikePrice: number,
+    optionType: "C" | "P",
+    date: string
+  ): Promise<OptionOpenClose> => {
+    const cacheKey = getOptionCacheKey(symbol, expiryDate, strikePrice, optionType, date);
+    const cached = optionCacheRef.current[cacheKey];
+    if (cached) return cached;
+
+    const pending = optionInFlightRef.current.get(cacheKey);
+    if (pending) return pending;
+
+    const request = (async () => {
+      const data = await fetchWithRateLimitRetry(() =>
+        fetchOptionOpenClose(symbol, expiryDate, strikePrice, optionType, date)
+      );
+      optionCacheRef.current[cacheKey] = data;
+      return data;
+    })();
+
+    optionInFlightRef.current.set(cacheKey, request);
+
+    try {
+      return await request;
+    } finally {
+      optionInFlightRef.current.delete(cacheKey);
+    }
   };
 
   const previewManualRoll = async (
@@ -267,8 +386,12 @@ const PutCalendarSpreadRoll: React.FC = () => {
   ): Promise<RollPreview> => {
     const symbol = stockTicker.trim().toUpperCase();
     const expiryFormatted = formatExpiryDate(nextShortExpiryDate);
-    const newShortPutData = await fetchWithRateLimitRetry(() =>
-      fetchOptionOpenClose(symbol, expiryFormatted, nextStrike, "P", currentDate)
+    const newShortPutData = await fetchOptionWithCache(
+      symbol,
+      expiryFormatted,
+      nextStrike,
+      "P",
+      currentDate
     );
 
     const newShortPutPremium = newShortPutData.closePrice;
@@ -288,6 +411,79 @@ const PutCalendarSpreadRoll: React.FC = () => {
     setRollPreview(null);
     setRollModalOpen(true);
     void previewManualRoll(row, defaultRollExpiryDate, row.strike);
+  };
+
+  const openPutLegModal = (row: PutCalendarRow, legType: "Short Put" | "Long Put") => {
+    const premium = legType === "Short Put" ? row.shortPutPrice : row.longPutPrice;
+    const expiryDate = legType === "Short Put" ? row.shortExpiryDate : row.longExpiryDate;
+
+    setPutLegModalData({
+      legType,
+      premium,
+      expiryDate,
+      strike: row.strike,
+      tradeDate: row.date,
+      status: row.status,
+    });
+    void loadRollingOptions(row);
+    setPutLegModalOpen(true);
+  };
+
+  const loadRollingOptions = async (row: PutCalendarRow) => {
+    setRollingOptions([]);
+
+    if (row.shortPutPrice === null) {
+      return;
+    }
+
+    setRollingOptionsLoading(true);
+    try {
+      const targetFromDate = dayjs(row.shortExpiryDate).add(7, "day").format("YYYY-MM-DD");
+      const candidateExpiries = tradingDates
+        .filter((value) =>
+          dayjs(value).isSame(dayjs(targetFromDate), "day") || dayjs(value).isAfter(dayjs(targetFromDate), "day")
+        )
+        .slice(0, 3);
+
+      const strikeCandidates = [
+        roundToNearestFive(row.strike - 10),
+        roundToNearestFive(row.strike - 5),
+        roundToNearestFive(row.strike),
+        roundToNearestFive(row.strike + 5),
+        roundToNearestFive(row.strike + 10),
+      ].filter((strike, index, arr) => strike > 0 && arr.indexOf(strike) === index);
+
+      const previews = await Promise.all(
+        candidateExpiries.flatMap((candidateExpiry) =>
+          strikeCandidates.map(async (candidateStrike) => {
+            const preview = await getRollPreview(
+              row.date,
+              row.shortPutPrice,
+              candidateExpiry,
+              candidateStrike
+            );
+
+            return {
+              key: `${candidateExpiry}-${candidateStrike}`,
+              expiryDate: candidateExpiry,
+              strike: candidateStrike,
+              newShortPutPremium: preview.newShortPutPremium,
+              netCreditDebit: preview.netCreditDebit,
+            };
+          })
+        )
+      );
+
+      const sorted = previews.sort((a, b) => {
+        const aValue = a.netCreditDebit ?? Number.NEGATIVE_INFINITY;
+        const bValue = b.netCreditDebit ?? Number.NEGATIVE_INFINITY;
+        return bValue - aValue;
+      });
+
+      setRollingOptions(sorted);
+    } finally {
+      setRollingOptionsLoading(false);
+    }
   };
 
   const handleAutoRollOneWeek = async (row: PutCalendarRow) => {
@@ -363,6 +559,11 @@ const PutCalendarSpreadRoll: React.FC = () => {
     setError(null);
     setSummary(null);
     setLoading(true);
+    setProcessedSimulationCount(0);
+    setPauseState(false);
+    setPausePromptOpen(false);
+    setPauseCheckpointData(null);
+    manualPauseRequestedRef.current = false;
 
     try {
       const symbol = stockTicker.trim().toUpperCase();
@@ -387,9 +588,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
 
       const hasPutData = async (expiryDate: string): Promise<boolean> => {
         const expiryFormatted = formatExpiryDate(expiryDate);
-        const peData = await fetchWithRateLimitRetry(() =>
-          fetchOptionOpenClose(symbol, expiryFormatted, openingStrike, "P", firstDate)
-        );
+        const peData = await fetchOptionWithCache(symbol, expiryFormatted, openingStrike, "P", firstDate);
 
         return peData.statusCode === 200 && peData.closePrice !== null;
       };
@@ -471,6 +670,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
       let activeStrike = openingStrike;
       let rollNumber = 0;
       let entryNetCredit: number | null = null;
+      let entryShortPutPrice: number | null = null;
       let realisedPnl = 0;
       let autoRollStoppedReason: string | null = null;
 
@@ -484,6 +684,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
           activeShortExpiryDate = rollForToday.shortExpiryDate;
           activeStrike = roundToNearestFive(rollForToday.strike);
           entryNetCredit = null;
+          entryShortPutPrice = null;
           rollNumber += 1;
           realisedPnl += rollForToday.rollCreditDebit ?? 0;
         }
@@ -498,12 +699,8 @@ const PutCalendarSpreadRoll: React.FC = () => {
         const longExpFmt = formatExpiryDate(longExpiryDate);
 
         const [shortPutData, longPutData] = await Promise.all([
-          fetchWithRateLimitRetry(() =>
-            fetchOptionOpenClose(symbol, shortExpFmt, activeStrike, "P", date)
-          ),
-          fetchWithRateLimitRetry(() =>
-            fetchOptionOpenClose(symbol, longExpFmt, activeStrike, "P", date)
-          ),
+          fetchOptionWithCache(symbol, shortExpFmt, activeStrike, "P", date),
+          fetchOptionWithCache(symbol, longExpFmt, activeStrike, "P", date),
         ]);
 
         const shortPutPrice = shortPutData.closePrice;
@@ -513,6 +710,9 @@ const PutCalendarSpreadRoll: React.FC = () => {
 
         if (entryNetCredit === null) {
           entryNetCredit = currentNetCloseCost;
+        }
+        if (entryShortPutPrice === null) {
+          entryShortPutPrice = shortPutPrice;
         }
 
         const isExpiry = dayjs(date).isSame(dayjs(activeShortExpiryDate), "day");
@@ -557,7 +757,43 @@ const PutCalendarSpreadRoll: React.FC = () => {
           rollNumber,
         });
 
+        const processedCount = allRows.length;
+        setProcessedSimulationCount(processedCount);
+
+        const shouldAutoPause = processedCount % AUTO_PAUSE_EVERY_SIMULATIONS === 0;
+        const shouldManualPause = manualPauseRequestedRef.current;
+
+        if (shouldAutoPause || shouldManualPause) {
+          const shouldContinue = await openPausePrompt({
+            processedCount,
+            date,
+            rollNumber,
+            closingPrice: closePrice,
+            cumulativePnl: realisedPnl + unrealisedPnl,
+          });
+
+          if (!shouldContinue) {
+            autoRollStoppedReason = `Simulation stopped by user after ${processedCount} simulations on ${date}.`;
+            break;
+          }
+        }
+
+        if (isExpiry) {
+          autoRollStoppedReason =
+            `Simulation stopped at short expiry ${activeShortExpiryDate} on ${date}.`;
+          break;
+        }
+
         if (autoRollWeeklyEnabled) {
+          const meetsAutoRollDecayCondition =
+            entryShortPutPrice !== null &&
+            shortPutPrice !== null &&
+            shortPutPrice <= entryShortPutPrice * 0.5;
+
+          if (!meetsAutoRollDecayCondition) {
+            continue;
+          }
+
           const nextTradingDate = getNextTradingDate(date);
           if (!nextTradingDate) {
             autoRollStoppedReason = `Auto roll stopped after ${date}: no next trading date available.`;
@@ -656,6 +892,12 @@ const PutCalendarSpreadRoll: React.FC = () => {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to run put calendar spread simulation");
     } finally {
+      setPausePromptOpen(false);
+      setPauseState(false);
+      if (pauseDecisionResolverRef.current) {
+        pauseDecisionResolverRef.current(false);
+        pauseDecisionResolverRef.current = null;
+      }
       setLoading(false);
     }
   };
@@ -749,6 +991,19 @@ const PutCalendarSpreadRoll: React.FC = () => {
             Run Put Calendar Spread
           </Button>
           <Button
+            onClick={() => {
+              if (isPaused && pausePromptOpen) {
+                resolvePauseDecision(true);
+              } else {
+                manualPauseRequestedRef.current = true;
+                message.info("Pause requested. Simulation will ask to continue at the next checkpoint.");
+              }
+            }}
+            disabled={!loading}
+          >
+            {isPaused ? "Continue" : "Pause"}
+          </Button>
+          <Button
             type={autoRollWeeklyEnabled ? "primary" : "default"}
             onClick={() => setAutoRollWeeklyEnabled((previous) => !previous)}
             disabled={loading}
@@ -756,6 +1011,9 @@ const PutCalendarSpreadRoll: React.FC = () => {
             Auto Roll Weekly: {autoRollWeeklyEnabled ? "ON" : "OFF"}
           </Button>
         </Space>
+        <Text type="secondary" style={{ display: "block", marginTop: 8 }}>
+          Auto pause every {AUTO_PAUSE_EVERY_SIMULATIONS} simulations with continue confirmation. Processed: {processedSimulationCount}
+        </Text>
       </Card>
 
       {error && <Alert type="error" showIcon message="Put Calendar Spread Error" description={error} />}
@@ -830,14 +1088,28 @@ const PutCalendarSpreadRoll: React.FC = () => {
               dataIndex: "shortPutPrice",
               key: "shortPutPrice",
               width: 120,
-              render: (v: number | null) => formatCurrency(v),
+              render: (v: number | null, row: PutCalendarRow) =>
+                v !== null ? (
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openPutLegModal(row, "Short Put")}>
+                    {formatCurrency(v)}
+                  </Button>
+                ) : (
+                  "-"
+                ),
             },
             {
               title: "Long Put",
               dataIndex: "longPutPrice",
               key: "longPutPrice",
               width: 120,
-              render: (v: number | null) => formatCurrency(v),
+              render: (v: number | null, row: PutCalendarRow) =>
+                v !== null ? (
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openPutLegModal(row, "Long Put")}>
+                    {formatCurrency(v)}
+                  </Button>
+                ) : (
+                  "-"
+                ),
             },
             {
               title: "Entry Net Credit",
@@ -986,6 +1258,130 @@ const PutCalendarSpreadRoll: React.FC = () => {
               </Col>
             </Row>
           </Card>
+        </Space>
+      </Modal>
+
+      <Modal
+        title={putLegModalData ? `${putLegModalData.legType} Details` : "Put Leg Details"}
+        open={putLegModalOpen}
+        footer={null}
+        onCancel={() => {
+          setPutLegModalOpen(false);
+          setRollingOptions([]);
+          setRollingOptionsLoading(false);
+        }}
+      >
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+          <div>
+            <Text strong>Trade Date: </Text>
+            <Text>{putLegModalData?.tradeDate ?? "-"}</Text>
+          </div>
+          <div>
+            <Text strong>Expiry Date: </Text>
+            <Text>{putLegModalData?.expiryDate ?? "-"}</Text>
+          </div>
+          <div>
+            <Text strong>Strike: </Text>
+            <Text>{formatCurrency(putLegModalData?.strike ?? null)}</Text>
+          </div>
+          <div>
+            <Text strong>Premium: </Text>
+            <Text>{formatCurrency(putLegModalData?.premium ?? null)}</Text>
+          </div>
+          <div>
+            <Text strong>Status: </Text>
+            {putLegModalData ? statusTag(putLegModalData.status) : <Text>-</Text>}
+          </div>
+
+          <Card size="small" title="Rolling Options" loading={rollingOptionsLoading}>
+            {rollingOptions.length === 0 ? (
+              <Text type="secondary">No rolling options available for this row.</Text>
+            ) : (
+              <Table<RollingOptionCandidate>
+                size="small"
+                rowKey="key"
+                pagination={false}
+                dataSource={rollingOptions}
+                columns={[
+                  {
+                    title: "New Short Expiry",
+                    dataIndex: "expiryDate",
+                    key: "expiryDate",
+                    width: 130,
+                  },
+                  {
+                    title: "Strike",
+                    dataIndex: "strike",
+                    key: "strike",
+                    width: 100,
+                    render: (value: number) => formatCurrency(value),
+                  },
+                  {
+                    title: "New Premium",
+                    dataIndex: "newShortPutPremium",
+                    key: "newShortPutPremium",
+                    width: 120,
+                    render: (value: number | null) => formatCurrency(value),
+                  },
+                  {
+                    title: "Net Credit/Debit",
+                    dataIndex: "netCreditDebit",
+                    key: "netCreditDebit",
+                    render: (value: number | null) => (
+                      <Text style={{ color: (value ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                        {formatCurrency(value)}
+                      </Text>
+                    ),
+                  },
+                ]}
+              />
+            )}
+          </Card>
+        </Space>
+      </Modal>
+
+      <Modal
+        title="Simulation Paused"
+        open={pausePromptOpen}
+        closable={false}
+        maskClosable={false}
+        footer={[
+          <Button key="stop" danger onClick={() => resolvePauseDecision(false)}>
+            Stop
+          </Button>,
+          <Button key="continue" type="primary" onClick={() => resolvePauseDecision(true)}>
+            Continue
+          </Button>,
+        ]}
+      >
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+          <Text>Simulation paused for safety. Continue?</Text>
+          <div>
+            <Text strong>Processed Simulations: </Text>
+            <Text>{pauseCheckpointData?.processedCount ?? 0}</Text>
+          </div>
+          <div>
+            <Text strong>Current Date: </Text>
+            <Text>{pauseCheckpointData?.date ?? "-"}</Text>
+          </div>
+          <div>
+            <Text strong>Roll #: </Text>
+            <Text>{pauseCheckpointData?.rollNumber ?? 0}</Text>
+          </div>
+          <div>
+            <Text strong>Closing Price: </Text>
+            <Text>{formatCurrency(pauseCheckpointData?.closingPrice ?? null)}</Text>
+          </div>
+          <div>
+            <Text strong>Cumulative P&L: </Text>
+            <Text
+              style={{
+                color: (pauseCheckpointData?.cumulativePnl ?? 0) >= 0 ? "#3f8600" : "#cf1322",
+              }}
+            >
+              {formatCurrency(pauseCheckpointData?.cumulativePnl ?? null)}
+            </Text>
+          </div>
         </Space>
       </Modal>
     </Space>

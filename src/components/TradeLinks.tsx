@@ -91,9 +91,20 @@ interface RollPopupState {
   rollPremium: number;
 }
 
+interface SelectedOptionQuote {
+  date: string;
+  openPrice: number | null;
+  closePrice: number | null;
+  delta: number | null;
+  theta: number | null;
+}
+
+const FIXED_DEFAULT_CURRENT_DATE = dayjs("2025-01-02");
+const FIXED_DEFAULT_EXPIRY_DATE = dayjs("2025-12-19");
+
 const TradeLinks: React.FC = () => {
-  const defaultCurrentDate = dayjs();
-  const defaultExpiryDate = getNextFriday(defaultCurrentDate);
+  const defaultCurrentDate = FIXED_DEFAULT_CURRENT_DATE;
+  const defaultExpiryDate = FIXED_DEFAULT_EXPIRY_DATE;
   const defaultLongExpiryDate = getNextFriday(defaultExpiryDate.add(1, "day"));
   const [form] = Form.useForm<TradeFormValues>();
   const watchedStrike = Form.useWatch("strike", form);
@@ -113,6 +124,8 @@ const TradeLinks: React.FC = () => {
   const [autoApiPricing, setAutoApiPricing] = useState(true);
   const [probableOptions, setProbableOptions] = useState<ProbableOptionCandidate[]>([]);
   const [probableLoading, setProbableLoading] = useState(false);
+  const [optionQuoteLoading, setOptionQuoteLoading] = useState(false);
+  const [selectedOptionQuote, setSelectedOptionQuote] = useState<SelectedOptionQuote | null>(null);
   const [sectionPremiumsByDate, setSectionPremiumsByDate] = useState<Record<string, Record<string, number>>>({});
   const [dateSections, setDateSections] = useState<string[]>([]);
   const [sectionTwoDate, setSectionTwoDate] = useState<string | null>(null);
@@ -135,17 +148,15 @@ const TradeLinks: React.FC = () => {
 
     try {
       const parsed = JSON.parse(rawDraft) as Partial<PersistedTradeFormValues>;
-      const draftCurrentDate = parsed.currentDate ? dayjs(parsed.currentDate) : defaultCurrentDate;
-      const parsedExpiry = parsed.expiry ? dayjs(parsed.expiry) : null;
       const parsedLongExpiry = parsed.longExpiry ? dayjs(parsed.longExpiry) : null;
       const draftValues: Partial<TradeFormValues> = {
         ...parsed,
-        currentDate: draftCurrentDate,
-        expiry: parsedExpiry && parsedExpiry.isValid() ? parsedExpiry : getNextFriday(draftCurrentDate),
+        currentDate: FIXED_DEFAULT_CURRENT_DATE,
+        expiry: FIXED_DEFAULT_EXPIRY_DATE,
         longExpiry:
           parsedLongExpiry && parsedLongExpiry.isValid()
             ? parsedLongExpiry
-            : getNextFriday(getNextFriday(draftCurrentDate).add(1, "day")),
+            : getNextFriday(FIXED_DEFAULT_EXPIRY_DATE.add(1, "day")),
       };
       form.setFieldsValue(draftValues);
     } catch {
@@ -468,6 +479,89 @@ const TradeLinks: React.FC = () => {
       }
     } finally {
       setPremiumLoading(false);
+    }
+  };
+
+  const getSelectedOptionRequest = () => {
+    const symbol = form.getFieldValue("symbol")?.trim().toUpperCase();
+    const optionType = form.getFieldValue("optionType") as OptionType | undefined;
+    const strike = Number(form.getFieldValue("strike"));
+    const expiry = form.getFieldValue("expiry") as dayjs.Dayjs | undefined;
+    const currentDate = form.getFieldValue("currentDate") as dayjs.Dayjs | undefined;
+
+    if (!symbol) {
+      message.warning("Enter symbol first");
+      return null;
+    }
+
+    if (!optionType) {
+      message.warning("Select option type");
+      return null;
+    }
+
+    if (!Number.isFinite(strike) || strike <= 0) {
+      message.warning("Enter valid strike first");
+      return null;
+    }
+
+    if (!expiry || !dayjs(expiry).isValid()) {
+      message.warning("Select expiry first");
+      return null;
+    }
+
+    if (!currentDate || !dayjs(currentDate).isValid()) {
+      message.warning("Select current date first");
+      return null;
+    }
+
+    return {
+      symbol,
+      strike,
+      date: currentDate.format("YYYY-MM-DD"),
+      formattedExpiry: formatExpiryDate(expiry.format("YYYY-MM-DD")),
+      apiOptionType: optionType === "Call" ? "C" as const : "P" as const,
+    };
+  };
+
+  const handleGetOptionPriceForSelectedDate = async () => {
+    const selectedRequest = getSelectedOptionRequest();
+    if (!selectedRequest) {
+      return;
+    }
+
+    setOptionQuoteLoading(true);
+    try {
+      const response = await fetchOptionOpenClose(
+        selectedRequest.symbol,
+        selectedRequest.formattedExpiry,
+        selectedRequest.strike,
+        selectedRequest.apiOptionType,
+        selectedRequest.date
+      );
+
+      setSelectedOptionQuote({
+        date: selectedRequest.date,
+        openPrice: response.openPrice,
+        closePrice: response.closePrice,
+        delta: response.delta,
+        theta: response.theta,
+      });
+
+      const premium = response.closePrice ?? response.openPrice;
+      if (premium !== null && Number.isFinite(premium)) {
+        setPremiumAndPersist(Number(premium.toFixed(2)));
+      }
+
+      if (response.openPrice === null && response.closePrice === null) {
+        message.warning("No option price returned for the selected values/date");
+        return;
+      }
+
+      message.success("Fetched option price from Massive API");
+    } catch {
+      message.error("Failed to fetch option price from Massive API");
+    } finally {
+      setOptionQuoteLoading(false);
     }
   };
 
@@ -1097,7 +1191,28 @@ const TradeLinks: React.FC = () => {
                 <Button onClick={handleLoadPremiumFromApi} loading={premiumLoading}>
                   Get Premium (Massive)
                 </Button>
+                <Button onClick={() => void handleGetOptionPriceForSelectedDate()} loading={optionQuoteLoading}>
+                  Get Option Price
+                </Button>
                 </Space>
+
+                {selectedOptionQuote && (
+                  <Space size={12} wrap>
+                    <Text type="secondary">Date: {selectedOptionQuote.date}</Text>
+                    <Text type="secondary">
+                      Open: {selectedOptionQuote.openPrice !== null ? selectedOptionQuote.openPrice.toFixed(2) : "-"}
+                    </Text>
+                    <Text type="secondary">
+                      Close: {selectedOptionQuote.closePrice !== null ? selectedOptionQuote.closePrice.toFixed(2) : "-"}
+                    </Text>
+                    <Text type="secondary">
+                      Delta: {selectedOptionQuote.delta !== null ? selectedOptionQuote.delta.toFixed(4) : "-"}
+                    </Text>
+                    <Text type="secondary">
+                      Theta: {selectedOptionQuote.theta !== null ? selectedOptionQuote.theta.toFixed(4) : "-"}
+                    </Text>
+                  </Space>
+                )}
 
                 {probableLoading && (
                   <Text type="secondary">Finding closest option prices...</Text>

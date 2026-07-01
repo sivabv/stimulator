@@ -84,7 +84,7 @@ const SPY_CLOSING_SERIES = spyClosingData as Array<{ date: string; close: number
 const SPY_CLOSING_DATES = SPY_CLOSING_SERIES.map((point) => point.date);
 const SPY_CLOSING_BY_DATE = new Map(SPY_CLOSING_SERIES.map((point) => [point.date, point.close]));
 const DEFAULT_START_DATE = SPY_CLOSING_DATES[0] ?? "2025-01-01";
-const DEFAULT_SIMULATION_DAYS = 50;
+const DEFAULT_SIMULATION_DAYS = 40;
 const TRADING_DAYS_PER_PHASE = 5;
 const DEFAULT_CALL_STRIKE_PERCENT_ABOVE = 1;
 const DEFAULT_PUT_STRIKE_PERCENT_BELOW = 1;

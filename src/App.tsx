@@ -27,6 +27,7 @@ const StraddleRolling = lazy(() => import("./components/StraddleRolling"));
 const PutCalendarSpreadRoll = lazy(() => import("./components/PutCalendarSpreadRoll"));
 const CallCalendarSpreadRoll = lazy(() => import("./components/CallCalendarSpreadRoll"));
 const LocalFullScreenCharts = lazy(() => import("./components/LocalFullScreenCharts"));
+const ChartsAndLink = lazy(() => import("./components/ChartsAndLink"));
 
 const App: React.FC = () => {
   // Backtest state
@@ -340,6 +341,15 @@ const App: React.FC = () => {
                 children: (
                   <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
                     <LocalFullScreenCharts />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "charts-and-link",
+                label: "Charts & Links",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <ChartsAndLink />
                   </Suspense>
                 ),
               },
