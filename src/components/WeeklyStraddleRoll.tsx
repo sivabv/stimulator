@@ -51,6 +51,7 @@ interface DailySummaryRow {
   key: string;
   date: string;
   closePrice: number | null;
+  newlyAddedOptions: number;
   shownOptions: number;
   activeOptions: number;
   callsActive: number;
@@ -90,6 +91,7 @@ const DEFAULT_PUT_STRIKE_PERCENT_BELOW = 1;
 const DEFAULT_DTE_MIN_DAYS = 1;
 const DEFAULT_DTE_MAX_DAYS = 4;
 const DEFAULT_DTE_TARGET_DAYS = 4;
+const DEFAULT_MAX_ACTIVE_LEGS_PER_TYPE = 5;
 
 const isBusinessDay = (date: string) => {
   const dayOfWeek = dayjs(date).day();
@@ -217,6 +219,21 @@ const getSimulationEndDate = (date: string, simulationDays: number, symbol: stri
   return tradingDates[tradingDates.length - 1] ?? "";
 };
 
+const isLegActiveOnDate = (leg: WeeklyStraddleLeg, asOfDate: string): boolean => {
+  const entryDate = dayjs(leg.entryDate);
+  const asOf = dayjs(asOfDate);
+  const closeDate = leg.closeDate ? dayjs(leg.closeDate) : null;
+
+  if (!entryDate.isValid() || !asOf.isValid()) {
+    return false;
+  }
+
+  return (
+    (asOf.isSame(entryDate, "day") || asOf.isAfter(entryDate, "day")) &&
+    (!closeDate || closeDate.isAfter(asOf, "day"))
+  );
+};
+
 const getExpiryDateInDteWindow = (
   entryDate: string,
   symbol: string,
@@ -336,6 +353,7 @@ const WeeklyStraddleRoll: React.FC<WeeklyStraddleRollProps> = ({ onOpenChartsTab
   const [dteMinDaysInput, setDteMinDaysInput] = useState<number | null>(null);
   const [dteMaxDaysInput, setDteMaxDaysInput] = useState<number | null>(null);
   const [dteTargetDaysInput, setDteTargetDaysInput] = useState<number | null>(null);
+  const [maxActiveLegsPerTypeInput, setMaxActiveLegsPerTypeInput] = useState<number | null>(null);
   const [activeDateFilter, setActiveDateFilter] = useState("");
   const [loading, setLoading] = useState(false);
   const [showSummary, setShowSummary] = useState(false);
@@ -603,6 +621,10 @@ const WeeklyStraddleRoll: React.FC<WeeklyStraddleRollProps> = ({ onOpenChartsTab
           ? Math.floor(dteTargetDaysInput)
           : DEFAULT_DTE_TARGET_DAYS;
       const effectiveDteTargetDays = Math.min(effectiveDteMaxDays, Math.max(effectiveDteMinDays, requestedTargetDte));
+      const effectiveMaxActiveLegsPerType =
+        typeof maxActiveLegsPerTypeInput === "number" && Number.isFinite(maxActiveLegsPerTypeInput) && maxActiveLegsPerTypeInput >= 1
+          ? Math.floor(maxActiveLegsPerTypeInput)
+          : DEFAULT_MAX_ACTIVE_LEGS_PER_TYPE;
       const dteConfig = {
         minDays: effectiveDteMinDays,
         maxDays: effectiveDteMaxDays,
@@ -654,12 +676,23 @@ const WeeklyStraddleRoll: React.FC<WeeklyStraddleRollProps> = ({ onOpenChartsTab
           );
           const tradeNumber = phaseStart + offset + 1;
 
-          const [callLeg, putLeg] = await Promise.all([
-            simulateLeg(symbol, tradeNumber, "Call", entryDate, callInitialExpiryDate, callStrike, dteConfig, effectiveEndDate),
-            simulateLeg(symbol, tradeNumber, "Put", entryDate, putInitialExpiryDate, putStrike, dteConfig, effectiveEndDate),
+          const activeCallCount = results.filter(
+            (leg) => leg.legType === "Call" && isLegActiveOnDate(leg, entryDate)
+          ).length;
+          const activePutCount = results.filter(
+            (leg) => leg.legType === "Put" && isLegActiveOnDate(leg, entryDate)
+          ).length;
+
+          const nextLegs = await Promise.all([
+            activeCallCount < effectiveMaxActiveLegsPerType
+              ? simulateLeg(symbol, tradeNumber, "Call", entryDate, callInitialExpiryDate, callStrike, dteConfig, effectiveEndDate)
+              : Promise.resolve(null),
+            activePutCount < effectiveMaxActiveLegsPerType
+              ? simulateLeg(symbol, tradeNumber, "Put", entryDate, putInitialExpiryDate, putStrike, dteConfig, effectiveEndDate)
+              : Promise.resolve(null),
           ]);
 
-          results.push(callLeg, putLeg);
+          results.push(...nextLegs.filter((leg): leg is WeeklyStraddleLeg => leg !== null));
           setRunProgress({
             processed: tradeNumber,
             total: entryDates.length,
@@ -806,12 +839,14 @@ const WeeklyStraddleRoll: React.FC<WeeklyStraddleRollProps> = ({ onOpenChartsTab
       const activeCallCount = optionsInWeek.filter((leg) => leg.legType === "Call" && isLegOpenOnDate(leg)).length;
       const activePutCount = optionsInWeek.filter((leg) => leg.legType === "Put" && isLegOpenOnDate(leg)).length;
       const activeOptionCount = optionsInWeek.filter((leg) => isLegOpenOnDate(leg)).length;
+      const newlyAddedOptionCount = legs.filter((leg) => dayjs(leg.entryDate).isSame(asOfDate, "day")).length;
       const shownOptionCount = optionsInWeek.length;
 
       return {
         key: asOfDate,
         date: asOfDate,
         closePrice,
+        newlyAddedOptions: newlyAddedOptionCount,
         shownOptions: shownOptionCount,
         activeOptions: activeOptionCount,
         callsActive: activeCallCount,
@@ -1146,6 +1181,22 @@ const WeeklyStraddleRoll: React.FC<WeeklyStraddleRollProps> = ({ onOpenChartsTab
                 placeholder={`${DEFAULT_DTE_TARGET_DAYS}`}
               />
             </Col>
+
+            <Col xs={24} md={12} lg={6}>
+              <Text>Max Active Calls/Puts (optional)</Text>
+              <InputNumber
+                min={1}
+                max={100}
+                value={maxActiveLegsPerTypeInput}
+                onChange={(value) =>
+                  setMaxActiveLegsPerTypeInput(
+                    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null
+                  )
+                }
+                style={{ width: "100%", marginTop: 8 }}
+                placeholder={`${DEFAULT_MAX_ACTIVE_LEGS_PER_TYPE}`}
+              />
+            </Col>
           </Row>
 
           <Space>
@@ -1197,12 +1248,13 @@ const WeeklyStraddleRoll: React.FC<WeeklyStraddleRollProps> = ({ onOpenChartsTab
                   key: "closePrice",
                   render: (value: number | null) => formatCurrency(value),
                 },
-                { title: "Shown Options", dataIndex: "shownOptions", key: "shownOptions" },
+                { title: "Newly Added", dataIndex: "newlyAddedOptions", key: "newlyAddedOptions" },
+                                { title: "Cumulative closed", dataIndex: "cumulativeClosed", key: "cumulativeClosed" },
+{ title: "Shown Options", dataIndex: "shownOptions", key: "shownOptions" },
                 { title: "Active Options", dataIndex: "activeOptions", key: "activeOptions" },
-                { title: "Calls Active", dataIndex: "callsActive", key: "callsActive" },
-                { title: "Puts Active", dataIndex: "putsActive", key: "putsActive" },
-                { title: "Closed in this week", dataIndex: "closedInThisWeek", key: "closedInThisWeek" },
-                { title: "Cumulative closed", dataIndex: "cumulativeClosed", key: "cumulativeClosed" },
+                // { title: "Calls Active", dataIndex: "callsActive", key: "callsActive" },
+                // { title: "Puts Active", dataIndex: "putsActive", key: "putsActive" },
+                // { title: "Closed in this week", dataIndex: "closedInThisWeek", key: "closedInThisWeek" },
               ]}
               dataSource={sectionData.summaryRows}
               style={{ marginBottom: 16 }}
