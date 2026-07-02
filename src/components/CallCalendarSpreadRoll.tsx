@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import {
   Alert,
   Button,
@@ -17,6 +17,16 @@ import {
 } from "antd";
 import { PlayCircleOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDatesJson from "../assets/trading_dates_2026.json";
 
@@ -61,11 +71,19 @@ interface RollPreview {
   netCreditDebit: number | null;
 }
 
+interface AutoSavedOptionCheckpoint {
+  date: string;
+  shortCallPrice: number | null;
+  longCallPrice: number | null;
+  savedAt: string;
+}
+
 type MasterStockData = Record<string, CachedStockPrice>;
 
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const MASTER_STOCK_DATA_KEY = "masterStockData";
+const CALL_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY = "callCalendarSpreadRollAutoSavedCheckpoint";
 const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
 const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
 const LONG_EXPIRY_MIN_DTE_DAYS = 150;
@@ -178,12 +196,28 @@ const saveMasterStockData = (data: MasterStockData) => {
   localStorage.setItem(MASTER_STOCK_DATA_KEY, JSON.stringify(data));
 };
 
+const loadAutoSavedCheckpoint = (): AutoSavedOptionCheckpoint | null => {
+  try {
+    const raw = localStorage.getItem(CALL_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as AutoSavedOptionCheckpoint;
+  } catch {
+    return null;
+  }
+};
+
+const saveAutoSavedCheckpoint = (checkpoint: AutoSavedOptionCheckpoint) => {
+  localStorage.setItem(CALL_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY, JSON.stringify(checkpoint));
+};
+
 const CallCalendarSpreadRoll: React.FC = () => {
   const [startDate, setStartDate] = useState("2025-01-02");
-  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("");
-  const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("");
+  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("2025-01-31");
+  const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("2025-12-19");
   const [stockTicker, setStockTicker] = useState("SPY");
-  const [autoRollWeeklyEnabled, setAutoRollWeeklyEnabled] = useState(true);
+  const [autoRollWeeklyEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<CallCalendarRow[]>([]);
@@ -195,6 +229,9 @@ const CallCalendarSpreadRoll: React.FC = () => {
   const [rollStrike, setRollStrike] = useState<number>(0);
   const [rollPreview, setRollPreview] = useState<RollPreview | null>(null);
   const [rollPreviewLoading, setRollPreviewLoading] = useState(false);
+  const [autoSavedCheckpoint, setAutoSavedCheckpoint] = useState<AutoSavedOptionCheckpoint | null>(
+    loadAutoSavedCheckpoint()
+  );
 
   const [summary, setSummary] = useState<{
     startDate: string;
@@ -510,6 +547,15 @@ const CallCalendarSpreadRoll: React.FC = () => {
         const currentNetCloseCost =
           shortCallPrice !== null && longCallPrice !== null ? shortCallPrice - longCallPrice : null;
 
+        const checkpoint: AutoSavedOptionCheckpoint = {
+          date,
+          shortCallPrice,
+          longCallPrice,
+          savedAt: new Date().toISOString(),
+        };
+        saveAutoSavedCheckpoint(checkpoint);
+        setAutoSavedCheckpoint(checkpoint);
+
         if (entryNetCredit === null) {
           entryNetCredit = currentNetCloseCost;
         }
@@ -702,6 +748,16 @@ const CallCalendarSpreadRoll: React.FC = () => {
     return <Tag color="green">Active</Tag>;
   };
 
+  const optionPriceChartData = useMemo(
+    () =>
+      rows.map((row) => ({
+        date: row.date,
+        shortCallPrice: row.shortCallPrice,
+        longCallPrice: row.longCallPrice,
+      })),
+    [rows]
+  );
+
   return (
     <Space direction="vertical" size={20} style={{ width: "100%" }}>
       <Card title="Call Calendar Spread (Roll)">
@@ -749,12 +805,14 @@ const CallCalendarSpreadRoll: React.FC = () => {
           </Button>
           <Button
             type={autoRollWeeklyEnabled ? "primary" : "default"}
-            onClick={() => setAutoRollWeeklyEnabled((previous) => !previous)}
-            disabled={loading}
+            disabled
           >
             Auto Roll Weekly: {autoRollWeeklyEnabled ? "ON" : "OFF"}
           </Button>
         </Space>
+        <Text type="secondary" style={{ display: "block", marginTop: 8 }}>
+          Auto-saved checkpoint: {autoSavedCheckpoint?.date ?? "-"} | Short Call {formatCurrency(autoSavedCheckpoint?.shortCallPrice ?? null)} | Long Call {formatCurrency(autoSavedCheckpoint?.longCallPrice ?? null)}
+        </Text>
       </Card>
 
       {error && <Alert type="error" showIcon message="Call Calendar Spread Error" description={error} />}
@@ -797,6 +855,42 @@ const CallCalendarSpreadRoll: React.FC = () => {
           </Row>
         </Card>
       )}
+
+      <Card title="Option Price Chart">
+        {optionPriceChartData.length === 0 ? (
+          <Text type="secondary">Run the simulation to view option prices by date.</Text>
+        ) : (
+          <div style={{ width: "100%", height: 320 }}>
+            <ResponsiveContainer>
+              <LineChart data={optionPriceChartData} margin={{ top: 16, right: 16, left: 8, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Line
+                  type="monotone"
+                  dataKey="shortCallPrice"
+                  name="Short Call Price"
+                  stroke="#cf1322"
+                  strokeWidth={2}
+                  dot={false}
+                  connectNulls={false}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="longCallPrice"
+                  name="Long Call Price"
+                  stroke="#0958d9"
+                  strokeWidth={2}
+                  dot={false}
+                  connectNulls={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </Card>
 
       <Card title="Records">
         <Table<CallCalendarRow>
@@ -910,7 +1004,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
                   <Button size="small" onClick={() => openRollModal(row)} disabled={loading}>
                     Roll
                   </Button>
-                  <Button size="small" onClick={() => void handleAutoRollOneWeek(row)} disabled={loading}>
+                  <Button size="small" onClick={() => void handleAutoRollOneWeek(row)} disabled>
                     Auto Roll 1W
                   </Button>
                 </Space>
