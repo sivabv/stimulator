@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -17,6 +17,16 @@ import {
 } from "antd";
 import { PlayCircleOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import {
   fetchOptionOpenClose,
   fetchStockOpenClose,
@@ -90,11 +100,19 @@ interface PauseCheckpointData {
   cumulativePnl: number | null;
 }
 
+interface AutoSavedOptionCheckpoint {
+  date: string;
+  shortPutPrice: number | null;
+  longPutPrice: number | null;
+  savedAt: string;
+}
+
 type MasterStockData = Record<string, CachedStockPrice>;
 
 const RATE_LIMIT_WAIT_MS = 2_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const MASTER_STOCK_DATA_KEY = "masterStockData";
+const PUT_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY = "putCalendarSpreadRollAutoSavedCheckpoint";
 const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
 const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
 const LONG_EXPIRY_MIN_DTE_DAYS = 150;
@@ -215,6 +233,22 @@ const saveMasterStockData = (data: MasterStockData) => {
   localStorage.setItem(MASTER_STOCK_DATA_KEY, JSON.stringify(data));
 };
 
+const loadAutoSavedCheckpoint = (): AutoSavedOptionCheckpoint | null => {
+  try {
+    const raw = localStorage.getItem(PUT_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as AutoSavedOptionCheckpoint;
+  } catch {
+    return null;
+  }
+};
+
+const saveAutoSavedCheckpoint = (checkpoint: AutoSavedOptionCheckpoint) => {
+  localStorage.setItem(PUT_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY, JSON.stringify(checkpoint));
+};
+
 const PutCalendarSpreadRoll: React.FC = () => {
   const [startDate, setStartDate] = useState("2025-01-02");
   const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("2025-01-31");
@@ -240,6 +274,9 @@ const PutCalendarSpreadRoll: React.FC = () => {
   const [processedSimulationCount, setProcessedSimulationCount] = useState(0);
   const [pausePromptOpen, setPausePromptOpen] = useState(false);
   const [pauseCheckpointData, setPauseCheckpointData] = useState<PauseCheckpointData | null>(null);
+  const [autoSavedCheckpoint, setAutoSavedCheckpoint] = useState<AutoSavedOptionCheckpoint | null>(
+    loadAutoSavedCheckpoint()
+  );
 
   const [summary, setSummary] = useState<{
     startDate: string;
@@ -708,6 +745,15 @@ const PutCalendarSpreadRoll: React.FC = () => {
         const currentNetCloseCost =
           shortPutPrice !== null && longPutPrice !== null ? shortPutPrice - longPutPrice : null;
 
+        const checkpoint: AutoSavedOptionCheckpoint = {
+          date,
+          shortPutPrice,
+          longPutPrice,
+          savedAt: new Date().toISOString(),
+        };
+        saveAutoSavedCheckpoint(checkpoint);
+        setAutoSavedCheckpoint(checkpoint);
+
         if (entryNetCredit === null) {
           entryNetCredit = currentNetCloseCost;
         }
@@ -945,6 +991,16 @@ const PutCalendarSpreadRoll: React.FC = () => {
     return <Tag color="green">Active</Tag>;
   };
 
+  const optionPriceChartData = useMemo(
+    () =>
+      rows.map((row) => ({
+        date: row.date,
+        shortPutPrice: row.shortPutPrice,
+        longPutPrice: row.longPutPrice,
+      })),
+    [rows]
+  );
+
   return (
     <Space direction="vertical" size={20} style={{ width: "100%" }}>
       <Card title="Put Calendar Spread (Roll)">
@@ -1014,6 +1070,9 @@ const PutCalendarSpreadRoll: React.FC = () => {
         <Text type="secondary" style={{ display: "block", marginTop: 8 }}>
           Auto pause every {AUTO_PAUSE_EVERY_SIMULATIONS} simulations with continue confirmation. Processed: {processedSimulationCount}
         </Text>
+        <Text type="secondary" style={{ display: "block", marginTop: 4 }}>
+          Auto-saved checkpoint: {autoSavedCheckpoint?.date ?? "-"} | Short Put {formatCurrency(autoSavedCheckpoint?.shortPutPrice ?? null)} | Long Put {formatCurrency(autoSavedCheckpoint?.longPutPrice ?? null)}
+        </Text>
       </Card>
 
       {error && <Alert type="error" showIcon message="Put Calendar Spread Error" description={error} />}
@@ -1056,6 +1115,42 @@ const PutCalendarSpreadRoll: React.FC = () => {
           </Row>
         </Card>
       )}
+
+      <Card title="Option Price Chart">
+        {optionPriceChartData.length === 0 ? (
+          <Text type="secondary">Run the simulation to view option prices by date.</Text>
+        ) : (
+          <div style={{ width: "100%", height: 320 }}>
+            <ResponsiveContainer>
+              <LineChart data={optionPriceChartData} margin={{ top: 16, right: 16, left: 8, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Line
+                  type="monotone"
+                  dataKey="shortPutPrice"
+                  name="Short Put Price"
+                  stroke="#cf1322"
+                  strokeWidth={2}
+                  dot={false}
+                  connectNulls={false}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="longPutPrice"
+                  name="Long Put Price"
+                  stroke="#0958d9"
+                  strokeWidth={2}
+                  dot={false}
+                  connectNulls={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </Card>
 
       <Card title="Records">
         <Table<PutCalendarRow>
