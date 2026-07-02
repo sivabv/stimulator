@@ -62,6 +62,14 @@ interface TradeLink {
   url: (symbol: string) => string;
 }
 
+interface DefaultWeeklyRecordSeed {
+  symbol: string;
+  optionType: OptionType;
+  strike: number;
+  startDate: string;
+  expiryDate: string;
+}
+
 const TRADE_LINKS: TradeLink[] = [
   {
     label: "TradingView Chart",
@@ -118,28 +126,33 @@ const CHARTS_LINK_WEEKLY_CLOSE_STORAGE_KEY = "chartsAndLinkWeeklyCloseRecords";
 const CHARTS_LINK_PAGE_SNAPSHOT_STORAGE_KEY = "chartsAndLinkPageSnapshot";
 const OPTION_SERIES_COLORS = ["#1677ff", "#13c2c2", "#52c41a", "#faad14", "#fa541c", "#eb2f96", "#722ed1"];
 
-const PRELOADED_WEEKLY_RECORDS: SavedWeeklyCloseRecord[] = [
-  {
-    id: "preload|SPY|P|600|2025-01-02|2025-12-19",
-    label: "SPY Put 600 (2025-01-02 -> 2025-12-19)",
-    symbol: "SPY",
-    optionType: "Put",
-    strike: 600,
-    startDate: "2025-01-02",
-    expiryDate: "2025-12-19",
-    rows: [],
-  },
-  {
-    id: "preload|SPY|C|600|2025-01-02|2025-12-19",
-    label: "SPY Call 600 (2025-01-02 -> 2025-12-19)",
-    symbol: "SPY",
-    optionType: "Call",
-    strike: 600,
-    startDate: "2025-01-02",
-    expiryDate: "2025-12-19",
-    rows: [],
-  },
+const DEFAULT_WEEKLY_RECORD_SEEDS: DefaultWeeklyRecordSeed[] = [
+  { symbol: "SPY", optionType: "Call", strike: 600, startDate: "2025-01-02", expiryDate: "2025-06-30" },
+  { symbol: "SPY", optionType: "Put", strike: 600, startDate: "2025-01-02", expiryDate: "2025-06-30" },
+  { symbol: "SPY", optionType: "Call", strike: 600, startDate: "2025-01-02", expiryDate: "2025-12-19" },
+  { symbol: "SPY", optionType: "Put", strike: 600, startDate: "2025-01-02", expiryDate: "2025-12-19" },
+  { symbol: "SPY", optionType: "Call", strike: 600, startDate: "2025-06-30", expiryDate: "2025-12-19" },
+  { symbol: "SPY", optionType: "Put", strike: 600, startDate: "2025-06-30", expiryDate: "2025-12-19" },
 ];
+
+const buildRecordId = (seed: DefaultWeeklyRecordSeed) => {
+  const side = seed.optionType === "Call" ? "C" : "P";
+  return [seed.symbol, side, seed.strike, seed.startDate, seed.expiryDate].join("|");
+};
+
+const buildRecordLabel = (seed: DefaultWeeklyRecordSeed) =>
+  `${seed.symbol} ${seed.optionType} ${seed.strike} (${seed.startDate} -> ${seed.expiryDate})`;
+
+const PRELOADED_WEEKLY_RECORDS: SavedWeeklyCloseRecord[] = DEFAULT_WEEKLY_RECORD_SEEDS.map((seed) => ({
+  id: buildRecordId(seed),
+  label: buildRecordLabel(seed),
+  symbol: seed.symbol,
+  optionType: seed.optionType,
+  strike: seed.strike,
+  startDate: seed.startDate,
+  expiryDate: seed.expiryDate,
+  rows: [],
+}));
 
 const ChartsAndLink: React.FC = () => {
   const [selectedSymbol, setSelectedSymbol] = useState("SPY");
@@ -154,6 +167,10 @@ const ChartsAndLink: React.FC = () => {
   const [savedWeeklyCloseRecords, setSavedWeeklyCloseRecords] = useState<SavedWeeklyCloseRecord[]>([]);
   const [activeWeeklyRecordId, setActiveWeeklyRecordId] = useState<string | null>(null);
   const [showWeeklyCloseTable, setShowWeeklyCloseTable] = useState(true);
+  const [showOptionClosingChart, setShowOptionClosingChart] = useState(false);
+  const [showPivotTable, setShowPivotTable] = useState(false);
+  const [showPivotGridChart, setShowPivotGridChart] = useState(true);
+  const [weeklyRecordsHydrated, setWeeklyRecordsHydrated] = useState(false);
   const [pivotValuePopup, setPivotValuePopup] = useState<{
     open: boolean;
     date: string;
@@ -349,6 +366,9 @@ const ChartsAndLink: React.FC = () => {
         expiryDate?: string | null;
         activeWeeklyRecordId?: string | null;
         showWeeklyCloseTable?: boolean;
+        showOptionClosingChart?: boolean;
+        showPivotTable?: boolean;
+        showPivotGridChart?: boolean;
       };
 
       if (typeof parsed.selectedSymbol === "string" && parsed.selectedSymbol) {
@@ -384,6 +404,18 @@ const ChartsAndLink: React.FC = () => {
       if (typeof parsed.showWeeklyCloseTable === "boolean") {
         setShowWeeklyCloseTable(parsed.showWeeklyCloseTable);
       }
+
+      if (typeof parsed.showOptionClosingChart === "boolean") {
+        setShowOptionClosingChart(parsed.showOptionClosingChart);
+      }
+
+      if (typeof parsed.showPivotTable === "boolean") {
+        setShowPivotTable(parsed.showPivotTable);
+      }
+
+      if (typeof parsed.showPivotGridChart === "boolean") {
+        setShowPivotGridChart(parsed.showPivotGridChart);
+      }
     } catch {
       // Ignore malformed page snapshot.
     }
@@ -394,6 +426,8 @@ const ChartsAndLink: React.FC = () => {
     if (!rawWeeklyRows) {
       setSavedWeeklyCloseRecords(PRELOADED_WEEKLY_RECORDS);
       setActiveWeeklyRecordId(PRELOADED_WEEKLY_RECORDS[0]?.id ?? null);
+      setWeeklyCloseRows(PRELOADED_WEEKLY_RECORDS[0]?.rows ?? []);
+      setWeeklyRecordsHydrated(true);
       return;
     }
 
@@ -439,14 +473,124 @@ const ChartsAndLink: React.FC = () => {
         } else {
           setSavedWeeklyCloseRecords(PRELOADED_WEEKLY_RECORDS);
           setActiveWeeklyRecordId(PRELOADED_WEEKLY_RECORDS[0]?.id ?? null);
+          setWeeklyCloseRows(PRELOADED_WEEKLY_RECORDS[0]?.rows ?? []);
         }
       }
     } catch {
       // Ignore malformed weekly close storage.
       setSavedWeeklyCloseRecords(PRELOADED_WEEKLY_RECORDS);
       setActiveWeeklyRecordId(PRELOADED_WEEKLY_RECORDS[0]?.id ?? null);
+      setWeeklyCloseRows(PRELOADED_WEEKLY_RECORDS[0]?.rows ?? []);
+    } finally {
+      setWeeklyRecordsHydrated(true);
     }
   }, []);
+
+  React.useEffect(() => {
+    if (!weeklyRecordsHydrated) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const seedDefaultRecords = async () => {
+      const existingById = new Map(savedWeeklyCloseRecords.map((record) => [record.id, record]));
+      const missingSeeds = DEFAULT_WEEKLY_RECORD_SEEDS.filter((seed) => !existingById.has(buildRecordId(seed)));
+
+      if (missingSeeds.length === 0) {
+        return;
+      }
+
+      setWeeklyCloseLoading(true);
+      try {
+        const builtRecords: SavedWeeklyCloseRecord[] = [];
+
+        for (const seed of missingSeeds) {
+          const start = dayjs(seed.startDate);
+          const expiry = dayjs(seed.expiryDate);
+          if (!start.isValid() || !expiry.isValid() || expiry.isBefore(start, "day")) {
+            continue;
+          }
+
+          const weeklyDates = buildWeeklyDatesUntilExpiry(start, expiry);
+          const optionSide = seed.optionType === "Call" ? "C" : "P";
+          const formattedExpiry = formatExpiryDate(expiry);
+
+          const rows: WeeklyOptionCloseRow[] = [];
+          for (const quoteDate of weeklyDates) {
+            const response = await fetchOptionOpenCloseCached(
+              seed.symbol,
+              formattedExpiry,
+              seed.strike,
+              optionSide,
+              quoteDate
+            );
+
+            rows.push({
+              key: quoteDate,
+              date: quoteDate,
+              closePrice: response.closePrice,
+            });
+          }
+
+          builtRecords.push({
+            id: buildRecordId(seed),
+            label: buildRecordLabel(seed),
+            symbol: seed.symbol,
+            optionType: seed.optionType,
+            strike: seed.strike,
+            startDate: seed.startDate,
+            expiryDate: seed.expiryDate,
+            rows,
+          });
+        }
+
+        if (cancelled || builtRecords.length === 0) {
+          return;
+        }
+
+        const nextRecords = [
+          ...savedWeeklyCloseRecords,
+          ...builtRecords,
+        ].sort((left, right) => {
+          const leftSeedIndex = DEFAULT_WEEKLY_RECORD_SEEDS.findIndex((seed) => buildRecordId(seed) === left.id);
+          const rightSeedIndex = DEFAULT_WEEKLY_RECORD_SEEDS.findIndex((seed) => buildRecordId(seed) === right.id);
+
+          if (leftSeedIndex >= 0 && rightSeedIndex >= 0) {
+            return leftSeedIndex - rightSeedIndex;
+          }
+          if (leftSeedIndex >= 0) {
+            return -1;
+          }
+          if (rightSeedIndex >= 0) {
+            return 1;
+          }
+          return left.label.localeCompare(right.label);
+        });
+
+        setSavedWeeklyCloseRecords(nextRecords);
+
+        if (!activeWeeklyRecordId && nextRecords.length > 0) {
+          setActiveWeeklyRecordId(nextRecords[0].id);
+          setWeeklyCloseRows(nextRecords[0].rows);
+        }
+      } catch {
+        if (!cancelled) {
+          message.warning("Some default SPY records could not be loaded on startup");
+        }
+      } finally {
+        if (!cancelled) {
+          setWeeklyCloseLoading(false);
+        }
+      }
+    };
+
+    void seedDefaultRecords();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWeeklyRecordId, savedWeeklyCloseRecords, weeklyRecordsHydrated]);
 
   React.useEffect(() => {
     const payload = {
@@ -469,6 +613,9 @@ const ChartsAndLink: React.FC = () => {
       expiryDate: expiryDate && expiryDate.isValid() ? expiryDate.format("YYYY-MM-DD") : null,
       activeWeeklyRecordId,
       showWeeklyCloseTable,
+      showOptionClosingChart,
+      showPivotTable,
+      showPivotGridChart,
     };
 
     localStorage.setItem(CHARTS_LINK_PAGE_SNAPSHOT_STORAGE_KEY, JSON.stringify(payload));
@@ -478,6 +625,9 @@ const ChartsAndLink: React.FC = () => {
     expiryDate,
     optionType,
     selectedSymbol,
+    showOptionClosingChart,
+    showPivotTable,
+    showPivotGridChart,
     showWeeklyCloseTable,
     strikePrice,
   ]);
@@ -632,8 +782,17 @@ const ChartsAndLink: React.FC = () => {
     close: d.close,
   }));
 
+  const chartRecords = React.useMemo(() => {
+    if (!activeWeeklyRecordId) {
+      return savedWeeklyCloseRecords;
+    }
+
+    const activeRecord = savedWeeklyCloseRecords.find((record) => record.id === activeWeeklyRecordId);
+    return activeRecord ? [activeRecord] : savedWeeklyCloseRecords;
+  }, [activeWeeklyRecordId, savedWeeklyCloseRecords]);
+
   const optionChartState = React.useMemo(() => {
-    const series = savedWeeklyCloseRecords.map((record, index) => ({
+    const series = chartRecords.map((record, index) => ({
       id: record.id,
       key: `series_${index + 1}`,
       label: record.label,
@@ -641,7 +800,7 @@ const ChartsAndLink: React.FC = () => {
 
     const dateMap = new Map<string, Record<string, string | number | null>>();
 
-    savedWeeklyCloseRecords.forEach((record, index) => {
+    chartRecords.forEach((record, index) => {
       const seriesKey = `series_${index + 1}`;
       record.rows.forEach((row) => {
         const existing = dateMap.get(row.date) ?? { date: row.date };
@@ -655,7 +814,22 @@ const ChartsAndLink: React.FC = () => {
       .map(([, row]) => row);
 
     return { data, series };
-  }, [savedWeeklyCloseRecords]);
+  }, [chartRecords]);
+
+  const handleSelectStoredRecord = (record: SavedWeeklyCloseRecord) => {
+    setActiveWeeklyRecordId(record.id);
+    setWeeklyCloseRows(record.rows);
+
+    const nextCurrentDate = dayjs(record.startDate);
+    if (nextCurrentDate.isValid()) {
+      setCurrentDate(nextCurrentDate);
+    }
+
+    const nextExpiryDate = dayjs(record.expiryDate);
+    if (nextExpiryDate.isValid()) {
+      setExpiryDate(nextExpiryDate);
+    }
+  };
 
   const pivotTableState = React.useMemo(() => {
     const recordsWithData = savedWeeklyCloseRecords
@@ -706,8 +880,13 @@ const ChartsAndLink: React.FC = () => {
       return col4 + col3 - col2 - col1;
     };
 
+    rows.forEach((row) => {
+      row.result = resultValueForRow(row);
+    });
+
     return {
       rows,
+      seriesMeta: columnMeta,
       columns: [
         {
           title: "Date",
@@ -756,13 +935,97 @@ const ChartsAndLink: React.FC = () => {
           key: "result",
           align: "center" as const,
           render: (_: unknown, row: OptionPivotRow) => {
-            const resultValue = resultValueForRow(row);
+            const resultValue = typeof row.result === "number" && Number.isFinite(row.result)
+              ? row.result
+              : resultValueForRow(row);
             return resultValue !== null ? resultValue.toFixed(2) : "-";
           },
         },
       ],
     };
   }, [savedWeeklyCloseRecords]);
+
+  const pivotGridChartState = React.useMemo(() => {
+    const chartEndDate = dayjs("2026-06-30");
+    const excludedChartDates = new Set([
+      "2025-01-09",
+      "2025-02-20",
+      "2025-04-24",
+      "2025-06-19",
+      "2025-11-27",
+      "2025-12-19",
+      "2025-12-25",
+      "2026-01-01",
+      "2026-06-11",
+    ]);
+    const pairedSeries = [
+      { key: "pair_1", name: "Col1 + Col2", leftKey: "dataset_1", rightKey: "dataset_2" },
+      { key: "pair_2", name: "Col3 + Col4", leftKey: "dataset_3", rightKey: "dataset_4" },
+      { key: "pair_3", name: "Col5 + Col6", leftKey: "dataset_5", rightKey: "dataset_6" },
+      { key: "pair_4", name: "Col7 + Col8", leftKey: "dataset_7", rightKey: "dataset_8" },
+      { key: "pair_5", name: "Col9 + Col10", leftKey: "dataset_9", rightKey: "dataset_10" },
+      { key: "pair_6", name: "Col11 + Col12", leftKey: "dataset_11", rightKey: "dataset_12" },
+    ] as Array<{ key: string; name: string; leftKey: string; rightKey: string }>;
+
+    const spyCloseByDate = new Map<string, number>();
+    const sortedSpyRows = [...spyClosingData].sort((left, right) => left.date.localeCompare(right.date));
+    sortedSpyRows.forEach((row) => {
+      if (typeof row.close === "number" && Number.isFinite(row.close)) {
+        spyCloseByDate.set(row.date, row.close);
+      }
+    });
+
+    const chartSeries = [
+      ...pairedSeries.map((seriesItem) => ({ key: seriesItem.key, name: seriesItem.name })),
+      { key: "spy_close", name: "SPY Closing Price" },
+    ];
+
+    const data = pivotTableState.rows
+      .filter((row) => {
+        const rowDate = dayjs(row.date);
+        const inRange = rowDate.isValid() && (rowDate.isBefore(chartEndDate, "day") || rowDate.isSame(chartEndDate, "day"));
+        return inRange && !excludedChartDates.has(row.date);
+      })
+      .map((row) => {
+        const dataPoint: Record<string, string | number | null> = {
+          date: row.date,
+        };
+
+        pairedSeries.forEach((seriesItem) => {
+          const leftValue = Number(row[seriesItem.leftKey]);
+          const rightValue = Number(row[seriesItem.rightKey]);
+          dataPoint[seriesItem.key] =
+            Number.isFinite(leftValue) && Number.isFinite(rightValue)
+              ? Number((leftValue + rightValue).toFixed(4))
+              : null;
+        });
+
+        const spyClose = spyCloseByDate.get(row.date);
+        dataPoint.spy_close =
+          typeof spyClose === "number" && Number.isFinite(spyClose)
+            ? Number(spyClose.toFixed(4))
+            : null;
+
+        return dataPoint;
+      });
+
+    const startValues = chartSeries.reduce<Record<string, number | null>>((accumulator, seriesItem) => {
+      const firstPoint = data.find((point) => {
+        const rawValue = point[seriesItem.key];
+        return typeof rawValue === "number" && Number.isFinite(rawValue);
+      });
+
+      const value = firstPoint?.[seriesItem.key];
+      accumulator[seriesItem.key] = typeof value === "number" && Number.isFinite(value) ? value : null;
+      return accumulator;
+    }, {});
+
+    return {
+      data,
+      series: chartSeries,
+      startValues,
+    };
+  }, [pivotTableState.rows, pivotTableState.seriesMeta]);
 
   const selectedDatePivotState = React.useMemo(() => {
     if (!currentDate || !currentDate.isValid()) {
@@ -1023,10 +1286,7 @@ const ChartsAndLink: React.FC = () => {
               <Button
                 key={record.id}
                 type={record.id === activeWeeklyRecordId ? "primary" : "default"}
-                onClick={() => {
-                  setActiveWeeklyRecordId(record.id);
-                  setWeeklyCloseRows(record.rows);
-                }}
+                onClick={() => handleSelectStoredRecord(record)}
               >
                 {record.label}
               </Button>
@@ -1061,40 +1321,48 @@ const ChartsAndLink: React.FC = () => {
       </Card>
 
       <Card title="Option Closing Price (Saved Records)" size="small">
-        {optionChartState.series.length === 0 ? (
-          <Typography.Text type="secondary">No saved option records to chart yet.</Typography.Text>
-        ) : (
-          <ResponsiveContainer width="100%" height={320}>
-            <LineChart data={optionChartState.data} margin={{ top: 8, right: 24, bottom: 8, left: 8 }}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="date" tick={{ fontSize: 11 }} />
-              <YAxis
-                domain={["auto", "auto"]}
-                tick={{ fontSize: 11 }}
-                tickFormatter={(v: number) => `$${v.toFixed(0)}`}
-              />
-              <Tooltip
-                formatter={(v) => {
-                  const numericValue = typeof v === "number" ? v : Number(v);
-                  const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
-                  return [`$${safeValue.toFixed(2)}`, "Close"];
-                }}
-              />
-              <Legend />
-              {optionChartState.series.map((series, index) => (
-                <Line
-                  key={series.id}
-                  type="monotone"
-                  dataKey={series.key}
-                  name={series.label}
-                  stroke={OPTION_SERIES_COLORS[index % OPTION_SERIES_COLORS.length]}
-                  dot={false}
-                  connectNulls
-                  strokeWidth={series.id === activeWeeklyRecordId ? 3 : 2}
+        <Space style={{ marginBottom: 12 }}>
+          <Button onClick={() => setShowOptionClosingChart((previous) => !previous)}>
+            {showOptionClosingChart ? "Hide Option Closing Chart" : "Show Option Closing Chart"}
+          </Button>
+        </Space>
+
+        {showOptionClosingChart && (
+          optionChartState.series.length === 0 ? (
+            <Typography.Text type="secondary">No saved option records to chart yet.</Typography.Text>
+          ) : (
+            <ResponsiveContainer width="100%" height={320}>
+              <LineChart data={optionChartState.data} margin={{ top: 8, right: 24, bottom: 8, left: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  tick={{ fontSize: 11 }}
+                  tickFormatter={(v: number) => `$${v.toFixed(0)}`}
                 />
-              ))}
-            </LineChart>
-          </ResponsiveContainer>
+                <Tooltip
+                  formatter={(v) => {
+                    const numericValue = typeof v === "number" ? v : Number(v);
+                    const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
+                    return [`$${safeValue.toFixed(2)}`, "Close"];
+                  }}
+                />
+                <Legend />
+                {optionChartState.series.map((series, index) => (
+                  <Line
+                    key={series.id}
+                    type="monotone"
+                    dataKey={series.key}
+                    name={series.label}
+                    stroke={OPTION_SERIES_COLORS[index % OPTION_SERIES_COLORS.length]}
+                    dot={false}
+                    connectNulls
+                    strokeWidth={series.id === activeWeeklyRecordId ? 3 : 2}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          )
         )}
       </Card>
 
@@ -1114,16 +1382,160 @@ const ChartsAndLink: React.FC = () => {
       </Card>
 
       <Card title="Date / Option Names Pivot Table" size="small">
-        <Table<OptionPivotRow>
-          size="small"
-          rowKey="key"
-          dataSource={pivotTableState.rows}
-          columns={pivotTableState.columns}
-          pagination={{ pageSize: 50 }}
-          scroll={{ x: true }}
-          locale={{ emptyText: "No loaded option data available for pivot table" }}
-        />
+        <Space style={{ marginBottom: 12 }}>
+          <Button onClick={() => setShowPivotTable((previous) => !previous)}>
+            {showPivotTable ? "Hide Pivot Table" : "Show Pivot Table"}
+          </Button>
+          <Button onClick={() => setShowPivotGridChart((previous) => !previous)}>
+            {showPivotGridChart ? "Hide Grid Date Chart" : "Show Grid Date Chart"}
+          </Button>
+        </Space>
+        {showPivotTable && (
+          <Table<OptionPivotRow>
+            size="small"
+            rowKey="key"
+            dataSource={pivotTableState.rows}
+            columns={pivotTableState.columns}
+            pagination={{ pageSize: 50 }}
+            scroll={{ x: true }}
+            locale={{ emptyText: "No loaded option data available for pivot table" }}
+          />
+        )}
       </Card>
+
+      {showPivotGridChart && (
+        <Card title="Grid Date vs Result Value" size="small">
+          {pivotGridChartState.data.length === 0 ? (
+            <Typography.Text type="secondary">No numeric pivot result values to chart.</Typography.Text>
+          ) : (
+            <ResponsiveContainer width="100%" height={420}>
+              <LineChart data={pivotGridChartState.data} margin={{ top: 8, right: 24, bottom: 8, left: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" interval={0} tick={{ fontSize: 11 }} />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  tick={{ fontSize: 11 }}
+                  tickFormatter={(v: number) => v.toFixed(2)}
+                />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload || payload.length === 0) {
+                      return null;
+                    }
+
+                    return (
+                      <div
+                        style={{
+                          background: "#fff",
+                          border: "1px solid #d9d9d9",
+                          padding: "8px 10px",
+                          borderRadius: 6,
+                          minWidth: 230,
+                        }}
+                      >
+                        <div style={{ fontWeight: 600, marginBottom: 6 }}>{String(label)}</div>
+                        {(() => {
+                          const rows = (payload as unknown as ReadonlyArray<{ dataKey?: string; value?: number | string; name?: string; color?: string }>)
+                            .map((item) => {
+                              const dataKey = item.dataKey ?? "";
+                              const numericValue = Number(item.value);
+                              const currentValue = Number.isFinite(numericValue) ? numericValue : null;
+                              const startValue = dataKey ? pivotGridChartState.startValues[dataKey] ?? null : null;
+                              const change =
+                                currentValue !== null && startValue !== null
+                                  ? Number((currentValue - startValue).toFixed(2))
+                                  : null;
+                              const percentChange =
+                                change !== null && startValue !== null && startValue !== 0
+                                  ? Number(((change / startValue) * 100).toFixed(2))
+                                  : null;
+
+                              return {
+                                key: `${dataKey}-${item.name ?? "series"}`,
+                                name: item.name ?? dataKey,
+                                color: item.color ?? "#595959",
+                                currentValue,
+                                startValue,
+                                change,
+                                percentChange,
+                              };
+                            })
+                            .sort((left, right) => {
+                              if (left.currentValue === null && right.currentValue === null) {
+                                return 0;
+                              }
+                              if (left.currentValue === null) {
+                                return 1;
+                              }
+                              if (right.currentValue === null) {
+                                return -1;
+                              }
+                              return right.currentValue - left.currentValue;
+                            });
+
+                          return (
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                              <thead>
+                                <tr>
+                                  <th style={{ textAlign: "left", paddingBottom: 4 }}>Series</th>
+                                  <th style={{ textAlign: "right", paddingBottom: 4 }}>Value</th>
+                                  <th style={{ textAlign: "right", paddingBottom: 4 }}>Start</th>
+                                  <th style={{ textAlign: "right", paddingBottom: 4 }}>Change</th>
+                                  <th style={{ textAlign: "right", paddingBottom: 4 }}>%</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {rows.map((row) => {
+                                  const changeColor =
+                                    row.change === null
+                                      ? "#8c8c8c"
+                                      : row.change > 0
+                                        ? "#389e0d"
+                                        : row.change < 0
+                                          ? "#cf1322"
+                                          : "#595959";
+                                  const signedChange = row.change === null ? "-" : `${row.change >= 0 ? "+" : ""}${row.change.toFixed(2)}`;
+                                  const signedPercent =
+                                    row.percentChange === null
+                                      ? "-"
+                                      : `${row.percentChange >= 0 ? "+" : ""}${row.percentChange.toFixed(2)}%`;
+
+                                  return (
+                                    <tr key={row.key}>
+                                      <td style={{ color: row.color, padding: "2px 0" }}>{row.name}</td>
+                                      <td style={{ textAlign: "right", padding: "2px 0" }}>{row.currentValue !== null ? row.currentValue.toFixed(2) : "-"}</td>
+                                      <td style={{ textAlign: "right", padding: "2px 0" }}>{row.startValue !== null ? row.startValue.toFixed(2) : "-"}</td>
+                                      <td style={{ textAlign: "right", color: changeColor, padding: "2px 0" }}>{signedChange}</td>
+                                      <td style={{ textAlign: "right", color: changeColor, padding: "2px 0" }}>{signedPercent}</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          );
+                        })()}
+                      </div>
+                    );
+                  }}
+                />
+                <Legend />
+                {pivotGridChartState.series.map((series, index) => (
+                  <Line
+                    key={series.key}
+                    type="monotone"
+                    dataKey={series.key}
+                    name={series.name}
+                    stroke={OPTION_SERIES_COLORS[index % OPTION_SERIES_COLORS.length]}
+                    dot={false}
+                    strokeWidth={series.key === "result" ? 3 : 2}
+                    connectNulls
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </Card>
+      )}
 
       {/* SPY Price Chart */}
       <Card title="SPY Closing Price" size="small">
