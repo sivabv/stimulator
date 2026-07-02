@@ -251,7 +251,7 @@ const saveAutoSavedCheckpoint = (checkpoint: AutoSavedOptionCheckpoint) => {
 
 const PutCalendarSpreadRoll: React.FC = () => {
   const [startDate, setStartDate] = useState("2025-01-02");
-  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("2025-01-31");
+  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("2025-06-30");
   const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("2025-12-19");
   const [stockTicker, setStockTicker] = useState("SPY");
   const [autoRollWeeklyEnabled, setAutoRollWeeklyEnabled] = useState(false);
