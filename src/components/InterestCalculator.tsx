@@ -31,6 +31,7 @@ interface AnalysisRow {
 	stockClose: number | null;
 	optionClose: number | null;
 	daysToExpiry: number;
+	delta: number | null;
 	interestPercentage: number | null;
 	annualInterestRate: number | null;
 	thetaPerDay: number | null;
@@ -163,6 +164,42 @@ const calculateThetaPerDay = (
 	return thetaPerYear / 365;
 };
 
+const calculateDelta = (
+	optionPrice: number | null,
+	stockPrice: number | null,
+	strike: number,
+	asOfDate: string,
+	expiryDate: string,
+	optionType: OptionType
+): number | null => {
+	if (
+		optionPrice === null ||
+		stockPrice === null ||
+		!Number.isFinite(optionPrice) ||
+		!Number.isFinite(stockPrice) ||
+		strike <= 0
+	) {
+		return null;
+	}
+
+	const daysToExpiry = dayjs(expiryDate).diff(dayjs(asOfDate), "day");
+	if (daysToExpiry <= 0) {
+		return null;
+	}
+
+	const timeYears = daysToExpiry / 365;
+	const impliedVol = estimateImpliedVolatility(optionPrice, stockPrice, strike, timeYears, optionType);
+	if (impliedVol === null) {
+		return null;
+	}
+
+	const sqrtT = Math.sqrt(timeYears);
+	const d1 = (Math.log(stockPrice / strike) + 0.5 * impliedVol * impliedVol * timeYears) /
+		(impliedVol * sqrtT);
+
+	return optionType === "C" ? normalCdf(d1) : normalCdf(d1) - 1;
+};
+
 const formatCurrency = (value: number | null) => {
 	if (value === null || !Number.isFinite(value)) {
 		return "-";
@@ -242,6 +279,7 @@ const InterestCalculator: React.FC = () => {
 			stockClose: givenDateStockClose,
 			optionClose: null,
 			daysToExpiry: dayjs(rowExpiryDate).diff(dayjs(startDate), "day"),
+			delta: null,
 			interestPercentage: null,
 			annualInterestRate: null,
 			thetaPerDay: null,
@@ -270,6 +308,14 @@ const InterestCalculator: React.FC = () => {
 				interestPercentage !== null && seededRow.daysToExpiry > 0
 					? interestPercentage * (365 / seededRow.daysToExpiry)
 					: null;
+			const delta = calculateDelta(
+				optionClose,
+				seededRow.stockClose,
+				seededRow.strikePrice,
+				seededRow.date,
+				seededRow.expiryDate,
+				optionType
+			);
 			const thetaPerDay = calculateThetaPerDay(
 				optionClose,
 				seededRow.stockClose,
@@ -293,6 +339,7 @@ const InterestCalculator: React.FC = () => {
 						? {
 							...row,
 							optionClose,
+							delta,
 							interestPercentage,
 							annualInterestRate,
 							thetaPerDay,
@@ -517,6 +564,13 @@ const InterestCalculator: React.FC = () => {
 							dataIndex: "optionClose",
 							key: "optionClose",
 							render: (value: number | null) => formatCurrency(value),
+						},
+						{
+							title: "Delta",
+							dataIndex: "delta",
+							key: "delta",
+							render: (value: number | null) =>
+								value !== null && Number.isFinite(value) ? value.toFixed(4) : "-",
 						},
 						{
 							title: "Days to expiry",

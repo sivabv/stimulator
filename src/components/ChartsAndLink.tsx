@@ -126,7 +126,7 @@ const normalCdf = (x: number): number => {
   const erfApprox =
     1 -
     (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) *
-      Math.exp(-absX * absX);
+    Math.exp(-absX * absX);
   return 0.5 * (1 + sign * erfApprox);
 };
 const blackScholesPrice = (
@@ -248,6 +248,59 @@ const DEFAULT_WEEKLY_RECORD_SEEDS: DefaultWeeklyRecordSeed[] = [
   { symbol: "SPY", optionType: "Put", strike: 600, startDate: "2025-06-30", expiryDate: "2025-12-19" },
 ];
 
+const PROBABLE_SHORT_EXPIRY_DATES = [
+  "Jan-31",
+  "Feb-21",
+  "Feb-28",
+  "Mar-21",
+  "May-16",
+  "Jun-30",
+  "Jul-18",
+  "Aug-15",
+  "Sep-19",
+
+  "Dec-19",
+] as const;
+
+const MONTH_TO_NUMBER: Record<string, string> = {
+  Jan: "01",
+  Feb: "02",
+  Mar: "03",
+  Apr: "04",
+  May: "05",
+  Jun: "06",
+  Jul: "07",
+  Aug: "08",
+  Sep: "09",
+  Oct: "10",
+  Nov: "11",
+  Dec: "12",
+};
+
+const resolveProbableShortExpiryIsoDates = (fromDate: Dayjs): string[] => {
+  const result = PROBABLE_SHORT_EXPIRY_DATES.map((label) => {
+    const [monthAbbrev, dayPart] = label.split("-");
+    const month = MONTH_TO_NUMBER[monthAbbrev];
+    if (!month || !dayPart) {
+      return null;
+    }
+
+    const day = dayPart.padStart(2, "0");
+    const currentYear = fromDate.year();
+    const currentYearCandidate = dayjs(`${currentYear}-${month}-${day}`);
+    const nextYearCandidate = dayjs(`${currentYear + 1}-${month}-${day}`);
+
+    const picked = currentYearCandidate.isBefore(fromDate, "day")
+      ? nextYearCandidate
+      : currentYearCandidate;
+
+    return picked.isValid() ? picked.format("YYYY-MM-DD") : null;
+  })
+    .filter((value): value is string => typeof value === "string");
+
+  return Array.from(new Set(result));
+};
+
 const buildRecordId = (seed: DefaultWeeklyRecordSeed) => {
   const side = seed.optionType === "Call" ? "C" : "P";
   return [seed.symbol, side, seed.strike, seed.startDate, seed.expiryDate].join("|");
@@ -268,6 +321,8 @@ const PRELOADED_WEEKLY_RECORDS: SavedWeeklyCloseRecord[] = DEFAULT_WEEKLY_RECORD
 }));
 
 const ChartsAndLink: React.FC = () => {
+  type LegendEntryLike = { dataKey?: string | number | ((obj: unknown) => unknown) };
+
   const [selectedSymbol, setSelectedSymbol] = useState("SPY");
   const [currentDate, setCurrentDate] = useState<Dayjs | null>(FIXED_DEFAULT_CURRENT_DATE);
   const [expiryDate, setExpiryDate] = useState<Dayjs | null>(FIXED_DEFAULT_EXPIRY_DATE);
@@ -285,6 +340,8 @@ const ChartsAndLink: React.FC = () => {
   const [showOptionClosingChart, setShowOptionClosingChart] = useState(false);
   const [showPivotTable, setShowPivotTable] = useState(false);
   const [showPivotGridChart, setShowPivotGridChart] = useState(true);
+  const [hiddenOptionSeriesKeys, setHiddenOptionSeriesKeys] = useState<string[]>([]);
+  const [hiddenPivotSeriesKeys, setHiddenPivotSeriesKeys] = useState<string[]>([]);
   const [weeklyRecordsHydrated, setWeeklyRecordsHydrated] = useState(false);
   const [pivotValuePopup, setPivotValuePopup] = useState<{
     open: boolean;
@@ -313,6 +370,18 @@ const ChartsAndLink: React.FC = () => {
   });
   const [rollOptionValueLoading, setRollOptionValueLoading] = useState(false);
   const stockCloseCacheRef = React.useRef<Record<string, number | null>>({});
+  const autoProbableShortRunRef = React.useRef<Set<string>>(new Set());
+
+  const toggleHiddenSeriesKey = (
+    key: string,
+    setState: React.Dispatch<React.SetStateAction<string[]>>
+  ) => {
+    setState((previous) =>
+      previous.includes(key)
+        ? previous.filter((existing) => existing !== key)
+        : [...previous, key]
+    );
+  };
 
   const extractStrikeFromOptionName = (optionName: string): number | null => {
     const strikeMatch = optionName.match(/\b(\d+(?:\.\d+)?)\b/);
@@ -353,7 +422,7 @@ const ChartsAndLink: React.FC = () => {
       const nextOptionValue = response.closePrice ?? response.openPrice;
       const netTradeResult =
         typeof nextOptionValue === "number" && Number.isFinite(nextOptionValue) &&
-        typeof pivotValuePopup.currentValue === "number" && Number.isFinite(pivotValuePopup.currentValue)
+          typeof pivotValuePopup.currentValue === "number" && Number.isFinite(pivotValuePopup.currentValue)
           ? nextOptionValue - pivotValuePopup.currentValue
           : null;
 
@@ -740,6 +809,190 @@ const ChartsAndLink: React.FC = () => {
   }, [activeWeeklyRecordId, savedWeeklyCloseRecords, weeklyRecordsHydrated]);
 
   React.useEffect(() => {
+    if (!weeklyRecordsHydrated || !currentDate || !currentDate.isValid()) {
+      return;
+    }
+
+    const normalizedSymbol = selectedSymbol.trim().toUpperCase();
+    if (!normalizedSymbol) {
+      return;
+    }
+
+    const currentDateIso = currentDate.format("YYYY-MM-DD");
+    const runKey = `${normalizedSymbol}|${currentDateIso}|${strikePrice ?? "NA"}`;
+    if (autoProbableShortRunRef.current.has(runKey)) {
+      return;
+    }
+    autoProbableShortRunRef.current.add(runKey);
+
+    let cancelled = false;
+
+    const runAutoProbableShortSimulation = async () => {
+      setWeeklyCloseLoading(true);
+      try {
+        let effectiveStrike =
+          typeof strikePrice === "number" && Number.isFinite(strikePrice) && strikePrice > 0
+            ? strikePrice
+            : null;
+
+        if (effectiveStrike === null) {
+          const startStock = await fetchStockOpenClose(normalizedSymbol, currentDateIso);
+          if (typeof startStock.closePrice === "number" && Number.isFinite(startStock.closePrice)) {
+            effectiveStrike = roundToNearestFive(startStock.closePrice);
+            if (!cancelled) {
+              setStrikePrice(effectiveStrike);
+            }
+          }
+        }
+
+        if (effectiveStrike === null) {
+          return;
+        }
+
+        const probableExpiryDates = resolveProbableShortExpiryIsoDates(currentDate)
+          .filter((expiry) => {
+            const expiryDateValue = dayjs(expiry);
+            return (
+              expiryDateValue.isSame(currentDate, "day") ||
+              expiryDateValue.isAfter(currentDate, "day")
+            );
+          });
+
+        if (probableExpiryDates.length === 0) {
+          return;
+        }
+
+        const recordsById = new Map(savedWeeklyCloseRecords.map((record) => [record.id, record]));
+        const updatedRecordIds = new Set<string>();
+
+        for (const expiryIso of probableExpiryDates) {
+          const expiryDateValue = dayjs(expiryIso);
+          const formattedExpiry = formatExpiryDate(expiryDateValue);
+
+          for (const side of ["C", "P"] as const) {
+            const recordId = [
+              normalizedSymbol,
+              side,
+              effectiveStrike,
+              currentDateIso,
+              expiryIso,
+            ].join("|");
+
+            // Step 1: get option price for current date using probable short expiry.
+            const startQuote = await fetchOptionOpenCloseCached(
+              normalizedSymbol,
+              formattedExpiry,
+              effectiveStrike,
+              side,
+              currentDateIso
+            );
+
+            if (!cancelled && !selectedOptionQuote) {
+              setSelectedOptionQuote({
+                date: currentDateIso,
+                openPrice: startQuote.openPrice,
+                closePrice: startQuote.closePrice,
+                delta: startQuote.delta,
+                theta: startQuote.theta,
+              });
+            }
+
+            // Step 2: get weekly closing prices up to expiry.
+            const weeklyDates = buildWeeklyDatesUntilExpiry(currentDate.startOf("day"), expiryDateValue.startOf("day"));
+            const rows: WeeklyOptionCloseRow[] = [];
+
+            for (const quoteDate of weeklyDates) {
+              const response = await fetchOptionOpenCloseCached(
+                normalizedSymbol,
+                formattedExpiry,
+                effectiveStrike,
+                side,
+                quoteDate
+              );
+
+              const stockClose = await fetchStockCloseCached(normalizedSymbol, quoteDate);
+              const thetaPerDay = calculateThetaPerDay(
+                response.closePrice,
+                stockClose,
+                effectiveStrike,
+                quoteDate,
+                expiryIso,
+                side === "C" ? "Call" : "Put"
+              );
+
+              rows.push({
+                key: quoteDate,
+                date: quoteDate,
+                closePrice: response.closePrice,
+                theta:
+                  typeof response.theta === "number" && Number.isFinite(response.theta)
+                    ? response.theta
+                    : thetaPerDay,
+              });
+            }
+
+            recordsById.set(recordId, {
+              id: recordId,
+              label: `${normalizedSymbol} ${side === "C" ? "Call" : "Put"} ${effectiveStrike} (${currentDateIso} -> ${expiryIso})`,
+              symbol: normalizedSymbol,
+              optionType: side === "C" ? "Call" : "Put",
+              strike: effectiveStrike,
+              startDate: currentDateIso,
+              expiryDate: expiryIso,
+              rows,
+            });
+            updatedRecordIds.add(recordId);
+          }
+        }
+
+        if (cancelled || updatedRecordIds.size === 0) {
+          return;
+        }
+
+        const nextRecords = Array.from(recordsById.values())
+          .sort((left, right) => {
+            if (left.startDate !== right.startDate) {
+              return left.startDate.localeCompare(right.startDate);
+            }
+            if (left.expiryDate !== right.expiryDate) {
+              return left.expiryDate.localeCompare(right.expiryDate);
+            }
+            return left.label.localeCompare(right.label);
+          });
+
+        setSavedWeeklyCloseRecords(nextRecords);
+
+        if (!activeWeeklyRecordId && nextRecords.length > 0) {
+          setActiveWeeklyRecordId(nextRecords[0].id);
+          setWeeklyCloseRows(nextRecords[0].rows);
+        }
+      } catch {
+        if (!cancelled) {
+          message.warning("Auto simulation for probable short expiries could not complete fully");
+        }
+      } finally {
+        if (!cancelled) {
+          setWeeklyCloseLoading(false);
+        }
+      }
+    };
+
+    void runAutoProbableShortSimulation();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeWeeklyRecordId,
+    currentDate,
+    savedWeeklyCloseRecords,
+    selectedOptionQuote,
+    selectedSymbol,
+    strikePrice,
+    weeklyRecordsHydrated,
+  ]);
+
+  React.useEffect(() => {
     const payload = {
       currentDate: currentDate && currentDate.isValid() ? currentDate.format("YYYY-MM-DD") : null,
       expiryDate: expiryDate && expiryDate.isValid() ? expiryDate.format("YYYY-MM-DD") : null,
@@ -1070,6 +1323,7 @@ const ChartsAndLink: React.FC = () => {
       recordId: record.id,
       symbol: record.symbol,
       optionSide: record.optionType === "Call" ? "C" as const : "P" as const,
+      startDate: record.startDate,
       expiryDate: record.expiryDate,
       defaultStrike: record.strike,
     }));
@@ -1087,6 +1341,11 @@ const ChartsAndLink: React.FC = () => {
     });
 
     const rows = Array.from(rowMap.values()).sort((left, right) => left.date.localeCompare(right.date));
+    const pairedColumnMeta = Array.from({ length: Math.ceil(columnMeta.length / 2) }, (_, pairIndex) => ({
+      left: columnMeta[pairIndex * 2],
+      right: columnMeta[pairIndex * 2 + 1],
+      key: `pair_col_${pairIndex + 1}`,
+    }));
 
     const resultValueForRow = (row: OptionPivotRow) => {
       const col1 = Number(row.dataset_1);
@@ -1116,44 +1375,66 @@ const ChartsAndLink: React.FC = () => {
           fixed: "left" as const,
           width: 130,
         },
-        ...columnMeta.map((meta) => ({
-          title: meta.title,
-          dataIndex: meta.key,
-          key: meta.key,
+        ...pairedColumnMeta.map((pairMeta) => ({
+          title: `${pairMeta.left?.title ?? "-"}${pairMeta.right ? " | " : ""}${pairMeta.right?.title ?? ""}`,
+          key: pairMeta.key,
           align: "center" as const,
-          render: (value: number | null | undefined, row: OptionPivotRow) => {
-            if (typeof value !== "number" || !Number.isFinite(value)) {
-              return "-";
-            }
+          render: (_: number | null | undefined, row: OptionPivotRow) => {
+            const renderLeg = (meta?: {
+              key: string;
+              title: string;
+              symbol: string;
+              optionSide: "C" | "P";
+              expiryDate: string;
+              defaultStrike: number;
+            }) => {
+              if (!meta) {
+                return null;
+              }
 
-            const thetaRaw = row[`${meta.key}_theta`];
-            const theta =
-              typeof thetaRaw === "number" && Number.isFinite(thetaRaw)
-                ? thetaRaw
-                : null;
+              const rawValue = row[meta.key];
+              const value = typeof rawValue === "number" && Number.isFinite(rawValue) ? rawValue : null;
+              if (value === null) {
+                return "-";
+              }
+
+              const thetaRaw = row[`${meta.key}_theta`];
+              const theta =
+                typeof thetaRaw === "number" && Number.isFinite(thetaRaw)
+                  ? thetaRaw
+                  : null;
+
+              return (
+                <Button
+                  type="link"
+                  size="small"
+                  onClick={() => {
+                    setPivotValuePopup({
+                      open: true,
+                      date: row.date,
+                      optionName: meta.title,
+                      currentValue: value,
+                      rollDate: getRollDateFromExpiry(meta.expiryDate),
+                      rollStrike: extractStrikeFromOptionName(meta.title) ?? meta.defaultStrike,
+                      symbol: meta.symbol,
+                      optionSide: meta.optionSide,
+                      expiryDate: meta.expiryDate,
+                      fetchedOptionValue: null,
+                      netTradeResult: null,
+                    });
+                  }}
+                >
+                  {`${value.toFixed(2)}${theta !== null ? ` (${theta.toFixed(4)})` : ""}`}
+                </Button>
+              );
+            };
 
             return (
-              <Button
-                type="link"
-                size="small"
-                onClick={() => {
-                  setPivotValuePopup({
-                    open: true,
-                    date: row.date,
-                    optionName: meta.title,
-                    currentValue: value,
-                    rollDate: getRollDateFromExpiry(meta.expiryDate),
-                    rollStrike: extractStrikeFromOptionName(meta.title) ?? meta.defaultStrike,
-                    symbol: meta.symbol,
-                    optionSide: meta.optionSide,
-                    expiryDate: meta.expiryDate,
-                    fetchedOptionValue: null,
-                    netTradeResult: null,
-                  });
-                }}
-              >
-                {`${value.toFixed(2)}${theta !== null ? ` (${theta.toFixed(4)})` : ""}`}
-              </Button>
+              <Space size={4}>
+                {renderLeg(pairMeta.left)}
+                {pairMeta.right ? <span>|</span> : null}
+                {pairMeta.right ? renderLeg(pairMeta.right) : null}
+              </Space>
             );
           },
         })),
@@ -1174,7 +1455,7 @@ const ChartsAndLink: React.FC = () => {
 
   const pivotGridChartState = React.useMemo(() => {
     const chartEndDate = dayjs("2026-06-30");
-    const excludedChartDates = new  Set([
+    const excludedChartDates = new Set([
       "2025-01-09",
       "2025-02-20",
       "2025-04-24",
@@ -1185,18 +1466,26 @@ const ChartsAndLink: React.FC = () => {
       "2026-01-01",
       "2026-06-11",
     ]);
-    const pairedSeries = [
-      { key: "pair_1", name: "Col1 + Col2", leftKey: "dataset_1", rightKey: "dataset_2" },
-      { key: "pair_2", name: "Col3 + Col4", leftKey: "dataset_3", rightKey: "dataset_4" },
-      { key: "pair_3", name: "Col5 + Col6", leftKey: "dataset_5", rightKey: "dataset_6" },
-      { key: "pair_4", name: "Col7 + Col8", leftKey: "dataset_7", rightKey: "dataset_8" },
-      { key: "pair_5", name: "Col9 + Col10", leftKey: "dataset_9", rightKey: "dataset_10" },
-      { key: "pair_6", name: "Col11 + Col12", leftKey: "dataset_11", rightKey: "dataset_12" },
-    ] as Array<{ key: string; name: string; leftKey: string; rightKey: string }>;
+    const maxDatasetColumns = Math.min(pivotTableState.seriesMeta.length, 30);
+    const pairedSeries = Array.from({ length: Math.floor(maxDatasetColumns / 2) }, (_, pairIndex) => {
+      const leftMeta = pivotTableState.seriesMeta[pairIndex * 2];
+      const rightMeta = pivotTableState.seriesMeta[pairIndex * 2 + 1];
+      const start = dayjs(leftMeta?.startDate);
+      const expiry = dayjs(leftMeta?.expiryDate);
+      const label =
+        start.isValid() && expiry.isValid()
+          ? `${start.format("MMM-DD")} -> ${expiry.format("MMM-DD")}`
+          : `${leftMeta?.title ?? `Pair ${pairIndex + 1}`}${rightMeta ? " | " : ""}${rightMeta?.title ?? ""}`;
 
-    const chartSeries = [
-      ...pairedSeries.map((seriesItem) => ({ key: seriesItem.key, name: seriesItem.name })),
-    ];
+      return {
+        key: `pair_${pairIndex + 1}`,
+        leftKey: `dataset_${pairIndex * 2 + 1}`,
+        rightKey: `dataset_${pairIndex * 2 + 2}`,
+        name: label,
+      };
+    });
+
+    const chartSeries = pairedSeries.map(({ key, name }) => ({ key, name }));
 
     const data = pivotTableState.rows
       .filter((row) => {
@@ -1210,35 +1499,27 @@ const ChartsAndLink: React.FC = () => {
         };
 
         pairedSeries.forEach((seriesItem) => {
-          const leftValue = Number(row[seriesItem.leftKey]);
-          const rightValue = Number(row[seriesItem.rightKey]);
+          const leftValueRaw = row[seriesItem.leftKey];
+          const rightValueRaw = row[seriesItem.rightKey];
+          const leftValue = Number(leftValueRaw);
+          const rightValue = Number(rightValueRaw);
+
+          const hasLeft = Number.isFinite(leftValue);
+          const hasRight = Number.isFinite(rightValue);
+          const sumValue = hasLeft && hasRight
+            ? leftValue + rightValue
+            : null;
+
           const leftThetaRaw = row[`${seriesItem.leftKey}_theta`];
           const rightThetaRaw = row[`${seriesItem.rightKey}_theta`];
-          const leftTheta =
-            typeof leftThetaRaw === "number" && Number.isFinite(leftThetaRaw)
-              ? leftThetaRaw
-              : null;
-          const rightTheta =
-            typeof rightThetaRaw === "number" && Number.isFinite(rightThetaRaw)
-              ? rightThetaRaw
-              : null;
+          const leftTheta = typeof leftThetaRaw === "number" && Number.isFinite(leftThetaRaw) ? leftThetaRaw : null;
+          const rightTheta = typeof rightThetaRaw === "number" && Number.isFinite(rightThetaRaw) ? rightThetaRaw : null;
+
+          dataPoint[seriesItem.key] = toChartValue(sumValue);
           dataPoint[`${seriesItem.key}_theta`] =
-            leftTheta !== null || rightTheta !== null
-              ? Number(((leftTheta ?? 0) + (rightTheta ?? 0)).toFixed(6))
+            leftTheta !== null && rightTheta !== null
+              ? leftTheta + rightTheta
               : null;
-
-          const isCol1ToCol6Pair =
-            (seriesItem.leftKey === "dataset_1" || seriesItem.leftKey === "dataset_3" || seriesItem.leftKey === "dataset_5") &&
-            (seriesItem.rightKey === "dataset_2" || seriesItem.rightKey === "dataset_4" || seriesItem.rightKey === "dataset_6");
-
-          const hasBothFinite = Number.isFinite(leftValue) && Number.isFinite(rightValue);
-          const hasAnyZeroOrNullForCol1ToCol6 = isCol1ToCol6Pair && (!hasBothFinite || leftValue === 0 || rightValue === 0);
-
-          const pairValue =
-            hasBothFinite && !hasAnyZeroOrNullForCol1ToCol6
-              ? Number((leftValue + rightValue).toFixed(4))
-              : null;
-          dataPoint[seriesItem.key] = toChartValue(pairValue);
         });
 
         return dataPoint;
@@ -1523,6 +1804,9 @@ const ChartsAndLink: React.FC = () => {
             </Button>
           </Form.Item>
         </Form>
+        <Typography.Text type="secondary" style={{ display: "block", marginTop: 10 }}>
+          Probable short expiry dates: {PROBABLE_SHORT_EXPIRY_DATES.join(", ")}
+        </Typography.Text>
         {selectedOptionQuote && (
           <Space size={12} wrap style={{ marginTop: 12 }}>
             <Typography.Text type="secondary">Date: {selectedOptionQuote.date}</Typography.Text>
@@ -1618,7 +1902,24 @@ const ChartsAndLink: React.FC = () => {
                     return [safeValue !== null ? `$${safeValue.toFixed(2)}` : "-", "Close"];
                   }}
                 />
-                <Legend />
+                <Legend
+                  onClick={(entry: LegendEntryLike) => {
+                    const key = typeof entry.dataKey === "string" ? entry.dataKey : "";
+                    if (!key) {
+                      return;
+                    }
+                    toggleHiddenSeriesKey(key, setHiddenOptionSeriesKeys);
+                  }}
+                  formatter={(value, entry: LegendEntryLike) => {
+                    const key = typeof entry.dataKey === "string" ? entry.dataKey : "";
+                    const hidden = key ? hiddenOptionSeriesKeys.includes(key) : false;
+                    return (
+                      <span style={{ color: hidden ? "#8c8c8c" : "inherit", textDecoration: hidden ? "line-through" : "none" }}>
+                        {String(value)}
+                      </span>
+                    );
+                  }}
+                />
                 {optionChartState.series.map((series, index) => (
                   <Line
                     key={series.id}
@@ -1629,6 +1930,7 @@ const ChartsAndLink: React.FC = () => {
                     dot={false}
                     connectNulls
                     strokeWidth={series.id === activeWeeklyRecordId ? 3 : 2}
+                    hide={hiddenOptionSeriesKeys.includes(series.key)}
                   />
                 ))}
               </LineChart>
@@ -1814,7 +2116,24 @@ const ChartsAndLink: React.FC = () => {
                     );
                   }}
                 />
-                <Legend />
+                <Legend
+                  onClick={(entry: LegendEntryLike) => {
+                    const key = typeof entry.dataKey === "string" ? entry.dataKey : "";
+                    if (!key) {
+                      return;
+                    }
+                    toggleHiddenSeriesKey(key, setHiddenPivotSeriesKeys);
+                  }}
+                  formatter={(value, entry: LegendEntryLike) => {
+                    const key = typeof entry.dataKey === "string" ? entry.dataKey : "";
+                    const hidden = key ? hiddenPivotSeriesKeys.includes(key) : false;
+                    return (
+                      <span style={{ color: hidden ? "#8c8c8c" : "inherit", textDecoration: hidden ? "line-through" : "none" }}>
+                        {String(value)}
+                      </span>
+                    );
+                  }}
+                />
                 {pivotGridChartState.series.map((series, index) => (
                   <Line
                     key={series.key}
@@ -1825,6 +2144,7 @@ const ChartsAndLink: React.FC = () => {
                     dot={false}
                     strokeWidth={series.key === "result" ? 3 : 2}
                     connectNulls
+                    hide={hiddenPivotSeriesKeys.includes(series.key)}
                   />
                 ))}
               </LineChart>
