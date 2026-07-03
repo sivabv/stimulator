@@ -250,17 +250,29 @@ const InterestCalculator: React.FC = () => {
 	};
 
 	const findPreviousClose = async (normalizedSymbol: string, referenceDate: string): Promise<{ price: number; date: string } | null> => {
-		let cursor = dayjs(referenceDate).subtract(1, "day");
+		let backwardCursor = dayjs(referenceDate).subtract(1, "day");
 
 		for (let attempt = 0; attempt < 15; attempt += 1) {
-			const quoteDate = cursor.format("YYYY-MM-DD");
+			const quoteDate = backwardCursor.format("YYYY-MM-DD");
 			const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(normalizedSymbol, quoteDate));
 
 			if (typeof stockData.closePrice === "number" && Number.isFinite(stockData.closePrice)) {
 				return { price: stockData.closePrice, date: quoteDate };
 			}
 
-			cursor = cursor.subtract(1, "day");
+			backwardCursor = backwardCursor.subtract(1, "day");
+		}
+
+		let forwardCursor = dayjs(referenceDate).add(1, "day");
+		for (let attempt = 0; attempt < 5; attempt += 1) {
+			const quoteDate = forwardCursor.format("YYYY-MM-DD");
+			const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(normalizedSymbol, quoteDate));
+
+			if (typeof stockData.closePrice === "number" && Number.isFinite(stockData.closePrice)) {
+				return { price: stockData.closePrice, date: quoteDate };
+			}
+
+			forwardCursor = forwardCursor.add(1, "day");
 		}
 
 		return null;
@@ -389,7 +401,7 @@ const InterestCalculator: React.FC = () => {
 			const previousClose = await findPreviousClose(normalizedSymbol, startDate);
 
 			if (!previousClose) {
-				throw new Error(`No previous close price found for ${normalizedSymbol} before ${startDate}`);
+				throw new Error(`No close price found for ${normalizedSymbol} near ${startDate} (previous days and +5 days)`);
 			}
 
 			const roundedStrike = roundToNearestFive(previousClose.price);
@@ -427,7 +439,7 @@ const InterestCalculator: React.FC = () => {
 
 				const previousClose = await findPreviousClose(normalizedSymbol, startDate);
 				if (!previousClose) {
-					throw new Error(`No previous close price found for ${normalizedSymbol} before ${startDate}`);
+					throw new Error(`No close price found for ${normalizedSymbol} near ${startDate} (previous days and +5 days)`);
 				}
 
 				strikeToUse = roundToNearestFive(previousClose.price);

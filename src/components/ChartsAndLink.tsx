@@ -1140,17 +1140,29 @@ const ChartsAndLink: React.FC = () => {
   };
 
   const findPreviousClose = async (symbol: string, referenceDate: Dayjs): Promise<{ price: number; date: string } | null> => {
-    let cursor = referenceDate.subtract(1, "day");
+    let backwardCursor = referenceDate.subtract(1, "day");
 
     for (let attempt = 0; attempt < 15; attempt += 1) {
-      const quoteDate = cursor.format("YYYY-MM-DD");
+      const quoteDate = backwardCursor.format("YYYY-MM-DD");
       const closePrice = await fetchStockCloseCached(symbol, quoteDate);
 
       if (typeof closePrice === "number" && Number.isFinite(closePrice)) {
         return { price: closePrice, date: quoteDate };
       }
 
-      cursor = cursor.subtract(1, "day");
+      backwardCursor = backwardCursor.subtract(1, "day");
+    }
+
+    let forwardCursor = referenceDate.add(1, "day");
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const quoteDate = forwardCursor.format("YYYY-MM-DD");
+      const closePrice = await fetchStockCloseCached(symbol, quoteDate);
+
+      if (typeof closePrice === "number" && Number.isFinite(closePrice)) {
+        return { price: closePrice, date: quoteDate };
+      }
+
+      forwardCursor = forwardCursor.add(1, "day");
     }
 
     return null;
@@ -1235,7 +1247,7 @@ const ChartsAndLink: React.FC = () => {
       const previousClose = await findPreviousClose(selectedSymbol, currentDate);
 
       if (!previousClose) {
-        message.warning("No previous close found from API in recent dates");
+        message.warning("No close found from API in the fallback window (previous days and +5 days)");
         return;
       }
 
