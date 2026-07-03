@@ -238,6 +238,11 @@ const CHARTS_LINK_OPTION_API_CACHE_KEY = "chartsAndLinkOptionApiCache";
 const CHARTS_LINK_WEEKLY_CLOSE_STORAGE_KEY = "chartsAndLinkWeeklyCloseRecords";
 const CHARTS_LINK_PAGE_SNAPSHOT_STORAGE_KEY = "chartsAndLinkPageSnapshot";
 const OPTION_SERIES_COLORS = ["#1677ff", "#13c2c2", "#52c41a", "#faad14", "#fa541c", "#eb2f96", "#722ed1"];
+const SPY_LOCAL_CLOSE_BY_DATE = new Map(
+  spyClosingData
+    .filter((entry) => typeof entry.date === "string" && typeof entry.close === "number" && Number.isFinite(entry.close))
+    .map((entry) => [entry.date, entry.close] as const)
+);
 
 const DEFAULT_WEEKLY_RECORD_SEEDS: DefaultWeeklyRecordSeed[] = [
   { symbol: "SPY", optionType: "Call", strike: 600, startDate: "2025-01-02", expiryDate: "2025-06-30" },
@@ -250,14 +255,14 @@ const DEFAULT_WEEKLY_RECORD_SEEDS: DefaultWeeklyRecordSeed[] = [
 
 const PROBABLE_SHORT_EXPIRY_DATES = [
   "Jan-31",
-  "Feb-21",
-  "Feb-28",
-  "Mar-21",
-  "May-16",
+  // "Feb-21",
+  // "Feb-28",
+  // "Mar-21",
+  // "May-16",
   "Jun-30",
-  "Jul-18",
-  "Aug-15",
-  "Sep-19",
+  // "Jul-18",
+  // "Aug-15",
+  // "Sep-19",
 
   "Dec-19",
 ] as const;
@@ -371,6 +376,7 @@ const ChartsAndLink: React.FC = () => {
   const [rollOptionValueLoading, setRollOptionValueLoading] = useState(false);
   const stockCloseCacheRef = React.useRef<Record<string, number | null>>({});
   const autoProbableShortRunRef = React.useRef<Set<string>>(new Set());
+  const autoPreviousCloseRunRef = React.useRef<Set<string>>(new Set());
 
   const toggleHiddenSeriesKey = (
     key: string,
@@ -501,6 +507,19 @@ const ChartsAndLink: React.FC = () => {
     const cachedValue = stockCloseCacheRef.current[cacheKey];
     if (cachedValue !== undefined) {
       return cachedValue;
+    }
+
+    const normalizedSymbol = symbol.trim().toUpperCase();
+    if (normalizedSymbol === "SPY") {
+      const localClose = SPY_LOCAL_CLOSE_BY_DATE.get(quoteDate);
+      if (typeof localClose === "number" && Number.isFinite(localClose)) {
+        stockCloseCacheRef.current[cacheKey] = localClose;
+        return localClose;
+      }
+
+      // For SPY, prefer local dataset only to save API calls.
+      stockCloseCacheRef.current[cacheKey] = null;
+      return null;
     }
 
     const stockResponse = await fetchStockOpenClose(symbol, quoteDate);
@@ -687,6 +706,46 @@ const ChartsAndLink: React.FC = () => {
       setWeeklyRecordsHydrated(true);
     }
   }, []);
+
+  React.useEffect(() => {
+    if (!currentDate || !currentDate.isValid()) {
+      return;
+    }
+
+    const normalizedSymbol = selectedSymbol.trim().toUpperCase();
+    if (!normalizedSymbol) {
+      return;
+    }
+
+    const runKey = `${normalizedSymbol}|${currentDate.format("YYYY-MM-DD")}`;
+    if (autoPreviousCloseRunRef.current.has(runKey)) {
+      return;
+    }
+    autoPreviousCloseRunRef.current.add(runKey);
+
+    let cancelled = false;
+
+    const loadPreviousCloseAndStrike = async () => {
+      setPreviousCloseLoading(true);
+      try {
+        const previousClose = await findPreviousClose(normalizedSymbol, currentDate);
+        if (!previousClose || cancelled) {
+          return;
+        }
+
+        setPreviousClosePrice(previousClose.price);
+        setStrikePrice(roundToNearestFive(previousClose.price));
+      } finally {
+        setPreviousCloseLoading(false);
+      }
+    };
+
+    void loadPreviousCloseAndStrike();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentDate, selectedSymbol]);
 
   React.useEffect(() => {
     if (!weeklyRecordsHydrated) {
@@ -1080,6 +1139,23 @@ const ChartsAndLink: React.FC = () => {
     return dates;
   };
 
+  const findPreviousClose = async (symbol: string, referenceDate: Dayjs): Promise<{ price: number; date: string } | null> => {
+    let cursor = referenceDate.subtract(1, "day");
+
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      const quoteDate = cursor.format("YYYY-MM-DD");
+      const closePrice = await fetchStockCloseCached(symbol, quoteDate);
+
+      if (typeof closePrice === "number" && Number.isFinite(closePrice)) {
+        return { price: closePrice, date: quoteDate };
+      }
+
+      cursor = cursor.subtract(1, "day");
+    }
+
+    return null;
+  };
+
   const handleGetOptionPriceForSelectedDate = async () => {
     const selectedRequest = getSelectedOptionRequest();
     if (!selectedRequest) {
@@ -1088,10 +1164,21 @@ const ChartsAndLink: React.FC = () => {
 
     setOptionQuoteLoading(true);
     try {
+      const previousClose = await findPreviousClose(selectedRequest.symbol, selectedRequest.startDate);
+      let strikeForQuote = selectedRequest.strike;
+
+      if (previousClose) {
+        strikeForQuote = roundToNearestFive(previousClose.price);
+        setPreviousClosePrice(previousClose.price);
+        setStrikePrice(strikeForQuote);
+      } else {
+        message.warning("Previous close not found; using current strike price");
+      }
+
       const response = await fetchOptionOpenCloseCached(
         selectedRequest.symbol,
         selectedRequest.formattedExpiry,
-        selectedRequest.strike,
+        strikeForQuote,
         selectedRequest.optionSide,
         selectedRequest.startDate.format("YYYY-MM-DD")
       );
@@ -1145,30 +1232,15 @@ const ChartsAndLink: React.FC = () => {
 
     setPreviousCloseLoading(true);
     try {
-      let cursor = currentDate.subtract(1, "day");
-      let fetchedPrice: number | null = null;
-      let fetchedDate: string | null = null;
+      const previousClose = await findPreviousClose(selectedSymbol, currentDate);
 
-      for (let attempt = 0; attempt < 15; attempt += 1) {
-        const quoteDate = cursor.format("YYYY-MM-DD");
-        const response = await fetchStockOpenClose(selectedSymbol, quoteDate);
-
-        if (response.statusCode === 200 && typeof response.closePrice === "number" && Number.isFinite(response.closePrice)) {
-          fetchedPrice = response.closePrice;
-          fetchedDate = quoteDate;
-          break;
-        }
-
-        cursor = cursor.subtract(1, "day");
-      }
-
-      if (fetchedPrice === null || fetchedDate === null) {
+      if (!previousClose) {
         message.warning("No previous close found from API in recent dates");
         return;
       }
 
-      setPreviousClosePrice(fetchedPrice);
-      message.success(`Previous close fetched: ${selectedSymbol} ${fetchedDate} = ${fetchedPrice.toFixed(2)}`);
+      setPreviousClosePrice(previousClose.price);
+      message.success(`Previous close fetched: ${selectedSymbol} ${previousClose.date} = ${previousClose.price.toFixed(2)}`);
     } catch {
       message.error("Failed to fetch previous close from API");
     } finally {
@@ -1245,6 +1317,162 @@ const ChartsAndLink: React.FC = () => {
       message.success(`Fetched weekly close prices for ${rows.length} dates`);
     } catch {
       message.error("Failed to fetch weekly close prices from Massive API");
+    } finally {
+      setWeeklyCloseLoading(false);
+    }
+  };
+
+  const handleAnalyzePutOptions = async () => {
+    if (!currentDate || !currentDate.isValid()) {
+      message.warning("Select current date");
+      return;
+    }
+
+    const normalizedSymbol = selectedSymbol.trim().toUpperCase();
+    if (!normalizedSymbol) {
+      message.warning("Select ticker first");
+      return;
+    }
+
+    const currentDateIso = currentDate.format("YYYY-MM-DD");
+    setWeeklyCloseLoading(true);
+
+    try {
+      const previousClose = await findPreviousClose(normalizedSymbol, currentDate);
+      const strikeFromInput = typeof strikePrice === "number" && Number.isFinite(strikePrice) && strikePrice > 0
+        ? strikePrice
+        : null;
+      const effectiveStrike = previousClose
+        ? roundToNearestFive(previousClose.price)
+        : strikeFromInput;
+
+      if (previousClose) {
+        setPreviousClosePrice(previousClose.price);
+      }
+
+      if (effectiveStrike === null) {
+        message.warning("Could not determine strike from previous close or current input");
+        return;
+      }
+
+      setStrikePrice(effectiveStrike);
+
+      const probableExpiryDates = resolveProbableShortExpiryIsoDates(currentDate)
+        .filter((expiry) => {
+          const expiryDateValue = dayjs(expiry);
+          return expiryDateValue.isSame(currentDate, "day") || expiryDateValue.isAfter(currentDate, "day");
+        });
+
+      if (probableExpiryDates.length === 0) {
+        message.warning("No probable short expiry dates available from current date");
+        return;
+      }
+
+      const recordsById = new Map(savedWeeklyCloseRecords.map((record) => [record.id, record]));
+      let analyzedCount = 0;
+      let firstBuiltRecordId: string | null = null;
+
+      for (const expiryIso of probableExpiryDates) {
+        const expiryDateValue = dayjs(expiryIso);
+        const formattedExpiry = formatExpiryDate(expiryDateValue);
+        const side = "P" as const;
+        const recordId = [
+          normalizedSymbol,
+          side,
+          effectiveStrike,
+          currentDateIso,
+          expiryIso,
+        ].join("|");
+
+        const startQuote = await fetchOptionOpenCloseCached(
+          normalizedSymbol,
+          formattedExpiry,
+          effectiveStrike,
+          side,
+          currentDateIso
+        );
+
+        if (!selectedOptionQuote) {
+          setSelectedOptionQuote({
+            date: currentDateIso,
+            openPrice: startQuote.openPrice,
+            closePrice: startQuote.closePrice,
+            delta: startQuote.delta,
+            theta: startQuote.theta,
+          });
+        }
+
+        const weeklyDates = buildWeeklyDatesUntilExpiry(currentDate.startOf("day"), expiryDateValue.startOf("day"));
+        const rows: WeeklyOptionCloseRow[] = [];
+
+        for (const quoteDate of weeklyDates) {
+          const response = await fetchOptionOpenCloseCached(
+            normalizedSymbol,
+            formattedExpiry,
+            effectiveStrike,
+            side,
+            quoteDate
+          );
+
+          const stockClose = await fetchStockCloseCached(normalizedSymbol, quoteDate);
+          const thetaPerDay = calculateThetaPerDay(
+            response.closePrice,
+            stockClose,
+            effectiveStrike,
+            quoteDate,
+            expiryIso,
+            "Put"
+          );
+
+          rows.push({
+            key: quoteDate,
+            date: quoteDate,
+            closePrice: response.closePrice,
+            theta:
+              typeof response.theta === "number" && Number.isFinite(response.theta)
+                ? response.theta
+                : thetaPerDay,
+          });
+        }
+
+        recordsById.set(recordId, {
+          id: recordId,
+          label: `${normalizedSymbol} Put ${effectiveStrike} (${currentDateIso} -> ${expiryIso})`,
+          symbol: normalizedSymbol,
+          optionType: "Put",
+          strike: effectiveStrike,
+          startDate: currentDateIso,
+          expiryDate: expiryIso,
+          rows,
+        });
+
+        analyzedCount += 1;
+        if (firstBuiltRecordId === null) {
+          firstBuiltRecordId = recordId;
+        }
+      }
+
+      const nextRecords = Array.from(recordsById.values())
+        .sort((left, right) => {
+          if (left.startDate !== right.startDate) {
+            return left.startDate.localeCompare(right.startDate);
+          }
+          if (left.expiryDate !== right.expiryDate) {
+            return left.expiryDate.localeCompare(right.expiryDate);
+          }
+          return left.label.localeCompare(right.label);
+        });
+
+      setSavedWeeklyCloseRecords(nextRecords);
+      if (firstBuiltRecordId) {
+        setActiveWeeklyRecordId(firstBuiltRecordId);
+        const firstRecord = recordsById.get(firstBuiltRecordId);
+        setWeeklyCloseRows(firstRecord?.rows ?? []);
+      }
+
+      message.success(`Analyzed ${analyzedCount} put option series`);
+    } catch {
+      message.error("Failed to analyze put options");
     } finally {
       setWeeklyCloseLoading(false);
     }
@@ -1472,10 +1700,16 @@ const ChartsAndLink: React.FC = () => {
       const rightMeta = pivotTableState.seriesMeta[pairIndex * 2 + 1];
       const start = dayjs(leftMeta?.startDate);
       const expiry = dayjs(leftMeta?.expiryDate);
+      const strikePrefix =
+        typeof leftMeta?.defaultStrike === "number" && Number.isFinite(leftMeta.defaultStrike)
+          ? rightMeta && typeof rightMeta.defaultStrike === "number" && Number.isFinite(rightMeta.defaultStrike)
+            ? `${leftMeta.defaultStrike}/${rightMeta.defaultStrike} `
+            : `${leftMeta.defaultStrike} `
+          : "";
       const label =
         start.isValid() && expiry.isValid()
-          ? `${start.format("MMM-DD")} -> ${expiry.format("MMM-DD")}`
-          : `${leftMeta?.title ?? `Pair ${pairIndex + 1}`}${rightMeta ? " | " : ""}${rightMeta?.title ?? ""}`;
+          ? `${strikePrefix}${start.format("MMM-DD")} -> ${expiry.format("MMM-DD")}`
+          : `${strikePrefix}${leftMeta?.title ?? `Pair ${pairIndex + 1}`}${rightMeta ? " | " : ""}${rightMeta?.title ?? ""}`;
 
       return {
         key: `pair_${pairIndex + 1}`,
@@ -1796,6 +2030,11 @@ const ChartsAndLink: React.FC = () => {
           <Form.Item label=" ">
             <Button onClick={() => void handleGetWeeklyClosingPrices()} loading={weeklyCloseLoading}>
               Get Weekly Closing Prices
+            </Button>
+          </Form.Item>
+          <Form.Item label=" ">
+            <Button type="primary" onClick={() => void handleAnalyzePutOptions()} loading={weeklyCloseLoading}>
+              Analyze Put Options
             </Button>
           </Form.Item>
           <Form.Item label=" ">

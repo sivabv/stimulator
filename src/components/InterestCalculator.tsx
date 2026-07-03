@@ -249,6 +249,23 @@ const InterestCalculator: React.FC = () => {
 		return response;
 	};
 
+	const findPreviousClose = async (normalizedSymbol: string, referenceDate: string): Promise<{ price: number; date: string } | null> => {
+		let cursor = dayjs(referenceDate).subtract(1, "day");
+
+		for (let attempt = 0; attempt < 15; attempt += 1) {
+			const quoteDate = cursor.format("YYYY-MM-DD");
+			const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(normalizedSymbol, quoteDate));
+
+			if (typeof stockData.closePrice === "number" && Number.isFinite(stockData.closePrice)) {
+				return { price: stockData.closePrice, date: quoteDate };
+			}
+
+			cursor = cursor.subtract(1, "day");
+		}
+
+		return null;
+	};
+
 	const analyzeInterest = async (nextStrikePrice: number) => {
 		const normalizedSymbol = symbol.trim().toUpperCase();
 
@@ -369,16 +386,16 @@ const InterestCalculator: React.FC = () => {
 				throw new Error("Start date is invalid");
 			}
 
-			const stockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(normalizedSymbol, startDate));
+			const previousClose = await findPreviousClose(normalizedSymbol, startDate);
 
-			if (stockData.closePrice === null) {
-				throw new Error(`No stock close price found for ${normalizedSymbol} on ${startDate}`);
+			if (!previousClose) {
+				throw new Error(`No previous close price found for ${normalizedSymbol} before ${startDate}`);
 			}
 
-			const roundedStrike = roundToNearestFive(stockData.closePrice);
+			const roundedStrike = roundToNearestFive(previousClose.price);
 			setStrikePrice(roundedStrike);
 			await analyzeInterest(roundedStrike);
-			message.success(`Picked strike ${roundedStrike} from ${normalizedSymbol} close ${stockData.closePrice.toFixed(2)} and refreshed option data.`);
+			message.success(`Picked strike ${roundedStrike} from ${normalizedSymbol} previous close ${previousClose.date} = ${previousClose.price.toFixed(2)} and refreshed option data.`);
 		} catch (err) {
 			const nextError = err instanceof Error ? err.message : "Failed to load current strike price";
 			setError(nextError);
@@ -393,11 +410,32 @@ const InterestCalculator: React.FC = () => {
 		setLoading(true);
 
 		try {
-			if (strikePrice === null || !Number.isFinite(strikePrice) || strikePrice <= 0) {
-				throw new Error("Strike price must be a positive number");
+			const normalizedSymbol = symbol.trim().toUpperCase();
+			let strikeToUse =
+				typeof strikePrice === "number" && Number.isFinite(strikePrice) && strikePrice > 0
+					? strikePrice
+					: null;
+
+			if (strikeToUse === null) {
+				if (!normalizedSymbol) {
+					throw new Error("Symbol is required");
+				}
+
+				if (!dayjs(startDate).isValid()) {
+					throw new Error("Start date is invalid");
+				}
+
+				const previousClose = await findPreviousClose(normalizedSymbol, startDate);
+				if (!previousClose) {
+					throw new Error(`No previous close price found for ${normalizedSymbol} before ${startDate}`);
+				}
+
+				strikeToUse = roundToNearestFive(previousClose.price);
+				setStrikePrice(strikeToUse);
+				message.info(`Auto-picked strike ${strikeToUse} from ${normalizedSymbol} previous close ${previousClose.date} = ${previousClose.price.toFixed(2)}.`);
 			}
 
-			await analyzeInterest(strikePrice);
+			await analyzeInterest(strikeToUse);
 		} catch (err) {
 			const nextError = err instanceof Error ? err.message : "Failed to analyze interest";
 			setError(nextError);
