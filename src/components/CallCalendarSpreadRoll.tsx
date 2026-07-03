@@ -79,6 +79,14 @@ interface CallLegModalData {
   status: RowStatus;
 }
 
+interface RollingOptionCandidate {
+  key: string;
+  expiryDate: string;
+  strike: number;
+  newShortCallPremium: number | null;
+  netCreditDebit: number | null;
+}
+
 interface AutoSavedOptionCheckpoint {
   date: string;
   shortCallPrice: number | null;
@@ -344,6 +352,8 @@ const CallCalendarSpreadRoll: React.FC = () => {
   const [rollPreviewLoading, setRollPreviewLoading] = useState(false);
   const [callLegModalOpen, setCallLegModalOpen] = useState(false);
   const [callLegModalData, setCallLegModalData] = useState<CallLegModalData | null>(null);
+  const [rollingOptionsLoading, setRollingOptionsLoading] = useState(false);
+  const [rollingOptions, setRollingOptions] = useState<RollingOptionCandidate[]>([]);
   const [autoSavedCheckpoint, setAutoSavedCheckpoint] = useState<AutoSavedOptionCheckpoint | null>(
     loadAutoSavedCheckpoint()
   );
@@ -457,7 +467,65 @@ const CallCalendarSpreadRoll: React.FC = () => {
       tradeDate: row.date,
       status: row.status,
     });
+    void loadRollingOptions(row);
     setCallLegModalOpen(true);
+  };
+
+  const loadRollingOptions = async (row: CallCalendarRow) => {
+    setRollingOptions([]);
+
+    if (row.shortCallPrice === null) {
+      return;
+    }
+
+    setRollingOptionsLoading(true);
+    try {
+      const targetFromDate = dayjs(row.shortExpiryDate).add(7, "day").format("YYYY-MM-DD");
+      const candidateExpiries = tradingDates
+        .filter((value) =>
+          dayjs(value).isSame(dayjs(targetFromDate), "day") || dayjs(value).isAfter(dayjs(targetFromDate), "day")
+        )
+        .slice(0, 3);
+
+      const strikeCandidates = [
+        roundToNearestFive(row.strike - 10),
+        roundToNearestFive(row.strike - 5),
+        roundToNearestFive(row.strike),
+        roundToNearestFive(row.strike + 5),
+        roundToNearestFive(row.strike + 10),
+      ].filter((strike, index, arr) => strike > 0 && arr.indexOf(strike) === index);
+
+      const previews = await Promise.all(
+        candidateExpiries.flatMap((candidateExpiry) =>
+          strikeCandidates.map(async (candidateStrike) => {
+            const preview = await getRollPreview(
+              row.date,
+              row.shortCallPrice,
+              candidateExpiry,
+              candidateStrike
+            );
+
+            return {
+              key: `${candidateExpiry}-${candidateStrike}`,
+              expiryDate: candidateExpiry,
+              strike: candidateStrike,
+              newShortCallPremium: preview.newShortCallPremium,
+              netCreditDebit: preview.netCreditDebit,
+            };
+          })
+        )
+      );
+
+      const sorted = previews.sort((a, b) => {
+        const aValue = a.netCreditDebit ?? Number.NEGATIVE_INFINITY;
+        const bValue = b.netCreditDebit ?? Number.NEGATIVE_INFINITY;
+        return bValue - aValue;
+      });
+
+      setRollingOptions(sorted);
+    } finally {
+      setRollingOptionsLoading(false);
+    }
   };
 
   const applyDynamicRollStrike = (row: CallCalendarRow, percentOffset: number) => {
@@ -1362,6 +1430,8 @@ const CallCalendarSpreadRoll: React.FC = () => {
         onCancel={() => {
           setCallLegModalOpen(false);
           setCallLegModalData(null);
+          setRollingOptions([]);
+          setRollingOptionsLoading(false);
         }}
       >
         {callLegModalData ? (
@@ -1390,6 +1460,51 @@ const CallCalendarSpreadRoll: React.FC = () => {
               <Text strong>Status: </Text>
               <Text>{callLegModalData.status}</Text>
             </div>
+
+            <Card size="small" title="Rolling Options" loading={rollingOptionsLoading}>
+              {rollingOptions.length === 0 ? (
+                <Text type="secondary">No rolling options available for this row.</Text>
+              ) : (
+                <Table<RollingOptionCandidate>
+                  size="small"
+                  rowKey="key"
+                  pagination={false}
+                  dataSource={rollingOptions}
+                  columns={[
+                    {
+                      title: "New Short Expiry",
+                      dataIndex: "expiryDate",
+                      key: "expiryDate",
+                      width: 130,
+                    },
+                    {
+                      title: "Strike",
+                      dataIndex: "strike",
+                      key: "strike",
+                      width: 100,
+                      render: (value: number) => formatCurrency(value),
+                    },
+                    {
+                      title: "New Premium",
+                      dataIndex: "newShortCallPremium",
+                      key: "newShortCallPremium",
+                      width: 120,
+                      render: (value: number | null) => formatCurrency(value),
+                    },
+                    {
+                      title: "Net Credit/Debit",
+                      dataIndex: "netCreditDebit",
+                      key: "netCreditDebit",
+                      render: (value: number | null) => (
+                        <Text style={{ color: (value ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                          {formatCurrency(value)}
+                        </Text>
+                      ),
+                    },
+                  ]}
+                />
+              )}
+            </Card>
           </Space>
         ) : null}
       </Modal>

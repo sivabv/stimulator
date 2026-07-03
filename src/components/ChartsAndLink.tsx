@@ -31,7 +31,7 @@ interface WeeklyOptionCloseRow {
   key: string;
   date: string;
   closePrice: number | null;
-  thetaPerDay?: number | null;
+  theta: number | null;
 }
 
 interface SavedWeeklyCloseRecord {
@@ -114,7 +114,6 @@ const SQRT_TWO_PI = Math.sqrt(2 * Math.PI);
 const toChartValue = (value: number | null | undefined): number | null =>
   typeof value === "number" && Number.isFinite(value) && value !== 0 ? value : null;
 const normalPdf = (x: number): number => Math.exp(-0.5 * x * x) / SQRT_TWO_PI;
-
 const normalCdf = (x: number): number => {
   const sign = x < 0 ? -1 : 1;
   const absX = Math.abs(x) / Math.sqrt(2);
@@ -130,7 +129,6 @@ const normalCdf = (x: number): number => {
       Math.exp(-absX * absX);
   return 0.5 * (1 + sign * erfApprox);
 };
-
 const blackScholesPrice = (
   spot: number,
   strike: number,
@@ -152,7 +150,6 @@ const blackScholesPrice = (
 
   return strike * normalCdf(-d2) - spot * normalCdf(-d1);
 };
-
 const estimateImpliedVolatility = (
   marketPrice: number,
   spot: number,
@@ -188,7 +185,6 @@ const estimateImpliedVolatility = (
 
   return (low + high) / 2;
 };
-
 const calculateThetaPerDay = (
   optionPrice: number | null,
   stockPrice: number | null,
@@ -316,39 +312,7 @@ const ChartsAndLink: React.FC = () => {
     netTradeResult: null,
   });
   const [rollOptionValueLoading, setRollOptionValueLoading] = useState(false);
-  const stockCloseBySymbolDateRef = React.useRef<Record<string, number | null>>({});
-  const stockCloseInFlightRef = React.useRef<Map<string, Promise<number | null>>>(new Map());
-
-  const fetchStockCloseCached = async (symbol: string, quoteDate: string): Promise<number | null> => {
-    const cacheKey = `${symbol}|${quoteDate}`;
-    const cachedClose = stockCloseBySymbolDateRef.current[cacheKey];
-    if (cachedClose !== undefined) {
-      return cachedClose;
-    }
-
-    const pending = stockCloseInFlightRef.current.get(cacheKey);
-    if (pending) {
-      return pending;
-    }
-
-    const request = (async () => {
-      const response = await fetchStockOpenClose(symbol, quoteDate);
-      const closePrice =
-        typeof response.closePrice === "number" && Number.isFinite(response.closePrice)
-          ? response.closePrice
-          : null;
-      stockCloseBySymbolDateRef.current[cacheKey] = closePrice;
-      return closePrice;
-    })();
-
-    stockCloseInFlightRef.current.set(cacheKey, request);
-
-    try {
-      return await request;
-    } finally {
-      stockCloseInFlightRef.current.delete(cacheKey);
-    }
-  };
+  const stockCloseCacheRef = React.useRef<Record<string, number | null>>({});
 
   const extractStrikeFromOptionName = (optionName: string): number | null => {
     const strikeMatch = optionName.match(/\b(\d+(?:\.\d+)?)\b/);
@@ -463,6 +427,22 @@ const ChartsAndLink: React.FC = () => {
     return normalizedResponse;
   };
 
+  const fetchStockCloseCached = async (symbol: string, quoteDate: string): Promise<number | null> => {
+    const cacheKey = `${symbol}|${quoteDate}`;
+    const cachedValue = stockCloseCacheRef.current[cacheKey];
+    if (cachedValue !== undefined) {
+      return cachedValue;
+    }
+
+    const stockResponse = await fetchStockOpenClose(symbol, quoteDate);
+    const close =
+      typeof stockResponse.closePrice === "number" && Number.isFinite(stockResponse.closePrice)
+        ? stockResponse.closePrice
+        : null;
+    stockCloseCacheRef.current[cacheKey] = close;
+    return close;
+  };
+
   const sanitizeWeeklyRows = (rows: WeeklyOptionCloseRow[]) => {
     return rows
       .filter((row) => row && typeof row.date === "string")
@@ -470,86 +450,9 @@ const ChartsAndLink: React.FC = () => {
         key: row.date,
         date: row.date,
         closePrice: typeof row.closePrice === "number" && Number.isFinite(row.closePrice) ? row.closePrice : null,
-        thetaPerDay:
-          typeof row.thetaPerDay === "number" && Number.isFinite(row.thetaPerDay)
-            ? row.thetaPerDay
-            : null,
+        theta: typeof row.theta === "number" && Number.isFinite(row.theta) ? row.theta : null,
       }));
   };
-
-  React.useEffect(() => {
-    if (!weeklyRecordsHydrated || savedWeeklyCloseRecords.length === 0) {
-      return;
-    }
-
-    let cancelled = false;
-
-    const backfillMissingTheta = async () => {
-      const hasMissingTheta = savedWeeklyCloseRecords.some((record) =>
-        record.rows.some(
-          (row) =>
-            row.closePrice !== null &&
-            (row.thetaPerDay === null || row.thetaPerDay === undefined)
-        )
-      );
-
-      if (!hasMissingTheta) {
-        return;
-      }
-
-      const nextRecords: SavedWeeklyCloseRecord[] = [];
-
-      for (const record of savedWeeklyCloseRecords) {
-        const nextRows: WeeklyOptionCloseRow[] = [];
-
-        for (const row of record.rows) {
-          if (row.closePrice === null || (row.thetaPerDay !== null && row.thetaPerDay !== undefined)) {
-            nextRows.push(row);
-            continue;
-          }
-
-          const stockClose = await fetchStockCloseCached(record.symbol, row.date);
-          const thetaPerDay = calculateThetaPerDay(
-            row.closePrice,
-            stockClose,
-            record.strike,
-            row.date,
-            record.expiryDate,
-            record.optionType
-          );
-
-          nextRows.push({
-            ...row,
-            thetaPerDay,
-          });
-        }
-
-        nextRecords.push({
-          ...record,
-          rows: nextRows,
-        });
-      }
-
-      if (cancelled) {
-        return;
-      }
-
-      setSavedWeeklyCloseRecords(nextRecords);
-
-      if (activeWeeklyRecordId) {
-        const activeRecord = nextRecords.find((record) => record.id === activeWeeklyRecordId);
-        if (activeRecord) {
-          setWeeklyCloseRows(activeRecord.rows);
-        }
-      }
-    };
-
-    void backfillMissingTheta();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeWeeklyRecordId, savedWeeklyCloseRecords, weeklyRecordsHydrated]);
 
   React.useEffect(() => {
     const rawDates = localStorage.getItem(CHARTS_LINK_DATES_STORAGE_KEY);
@@ -770,7 +673,10 @@ const ChartsAndLink: React.FC = () => {
               key: quoteDate,
               date: quoteDate,
               closePrice: response.closePrice,
-              thetaPerDay,
+              theta:
+                typeof response.theta === "number" && Number.isFinite(response.theta)
+                  ? response.theta
+                  : thetaPerDay,
             });
           }
 
@@ -1051,7 +957,10 @@ const ChartsAndLink: React.FC = () => {
           key: quoteDate,
           date: quoteDate,
           closePrice: response.closePrice,
-          thetaPerDay,
+          theta:
+            typeof response.theta === "number" && Number.isFinite(response.theta)
+              ? response.theta
+              : thetaPerDay,
         });
       }
 
@@ -1116,17 +1025,6 @@ const ChartsAndLink: React.FC = () => {
       record.rows.forEach((row) => {
         const existing = dateMap.get(row.date) ?? { date: row.date };
         existing[seriesKey] = toChartValue(row.closePrice);
-        const currentTheta = existing.combinedTheta;
-        const thetaSeed =
-          typeof currentTheta === "number" && Number.isFinite(currentTheta)
-            ? currentTheta
-            : 0;
-        const rowTheta =
-          typeof row.thetaPerDay === "number" && Number.isFinite(row.thetaPerDay)
-            ? row.thetaPerDay
-            : 0;
-        const nextTheta = thetaSeed + rowTheta;
-        existing.combinedTheta = Number.isFinite(nextTheta) ? Number(nextTheta.toFixed(6)) : null;
         dateMap.set(row.date, existing);
       });
     });
@@ -1183,7 +1081,7 @@ const ChartsAndLink: React.FC = () => {
       record.rows.forEach((row) => {
         const existing = rowMap.get(row.date) ?? { key: row.date, date: row.date };
         existing[datasetKey] = row.closePrice;
-        existing[`${datasetKey}_theta`] = row.thetaPerDay ?? null;
+        existing[`${datasetKey}_theta`] = row.theta;
         rowMap.set(row.date, existing);
       });
     });
@@ -1298,7 +1196,6 @@ const ChartsAndLink: React.FC = () => {
 
     const chartSeries = [
       ...pairedSeries.map((seriesItem) => ({ key: seriesItem.key, name: seriesItem.name })),
-      { key: "combinedTheta", name: "Combined Theta/Day" },
     ];
 
     const data = pivotTableState.rows
@@ -1312,21 +1209,24 @@ const ChartsAndLink: React.FC = () => {
           date: row.date,
         };
 
-        const combinedTheta = pivotTableState.seriesMeta.reduce((sum, _meta, seriesIndex) => {
-          const thetaRaw = row[`dataset_${seriesIndex + 1}_theta`];
-          const thetaValue =
-            typeof thetaRaw === "number" && Number.isFinite(thetaRaw)
-              ? thetaRaw
-              : 0;
-          return sum + thetaValue;
-        }, 0);
-        dataPoint.combinedTheta = Number.isFinite(combinedTheta)
-          ? Number(combinedTheta.toFixed(6))
-          : null;
-
         pairedSeries.forEach((seriesItem) => {
           const leftValue = Number(row[seriesItem.leftKey]);
           const rightValue = Number(row[seriesItem.rightKey]);
+          const leftThetaRaw = row[`${seriesItem.leftKey}_theta`];
+          const rightThetaRaw = row[`${seriesItem.rightKey}_theta`];
+          const leftTheta =
+            typeof leftThetaRaw === "number" && Number.isFinite(leftThetaRaw)
+              ? leftThetaRaw
+              : null;
+          const rightTheta =
+            typeof rightThetaRaw === "number" && Number.isFinite(rightThetaRaw)
+              ? rightThetaRaw
+              : null;
+          dataPoint[`${seriesItem.key}_theta`] =
+            leftTheta !== null || rightTheta !== null
+              ? Number(((leftTheta ?? 0) + (rightTheta ?? 0)).toFixed(6))
+              : null;
+
           const isCol1ToCol6Pair =
             (seriesItem.leftKey === "dataset_1" || seriesItem.leftKey === "dataset_3" || seriesItem.leftKey === "dataset_5") &&
             (seriesItem.rightKey === "dataset_2" || seriesItem.rightKey === "dataset_4" || seriesItem.rightKey === "dataset_6");
@@ -1459,7 +1359,7 @@ const ChartsAndLink: React.FC = () => {
     recordsWithData.forEach((record, index) => {
       const matchingRow = record.rows.find((entry) => entry.date === selectedDateIso);
       row[`dataset_${index + 1}`] = matchingRow?.closePrice ?? null;
-      row[`dataset_${index + 1}_theta`] = matchingRow?.thetaPerDay ?? null;
+      row[`dataset_${index + 1}_theta`] = matchingRow?.theta ?? null;
     });
 
     row.result = resultValueForRow(row);
@@ -1680,7 +1580,11 @@ const ChartsAndLink: React.FC = () => {
                 title: "Closing Price",
                 dataIndex: "closePrice",
                 key: "closePrice",
-                render: (value: number | null) => (value !== null ? value.toFixed(2) : "-"),
+                render: (_: number | null, row: WeeklyOptionCloseRow) => {
+                  const close = row.closePrice !== null ? row.closePrice.toFixed(2) : "-";
+                  const theta = row.theta !== null ? row.theta.toFixed(4) : "-";
+                  return `${close} | ${theta}`;
+                },
               },
             ]}
           />
@@ -1707,22 +1611,10 @@ const ChartsAndLink: React.FC = () => {
                   tick={{ fontSize: 11 }}
                   tickFormatter={(v: number) => `$${v.toFixed(0)}`}
                 />
-                <YAxis
-                  yAxisId="theta"
-                  orientation="right"
-                  tick={{ fontSize: 11 }}
-                  tickFormatter={(v: number) => v.toFixed(3)}
-                />
                 <Tooltip
-                  formatter={(v, name) => {
+                  formatter={(v) => {
                     const numericValue = typeof v === "number" ? v : Number(v);
                     const safeValue = toChartValue(Number.isFinite(numericValue) ? numericValue : null);
-                    if (name === "Combined Theta/Day") {
-                      return [
-                        Number.isFinite(numericValue) ? numericValue.toFixed(4) : "-",
-                        "Combined Theta/Day",
-                      ];
-                    }
                     return [safeValue !== null ? `$${safeValue.toFixed(2)}` : "-", "Close"];
                   }}
                 />
@@ -1739,17 +1631,6 @@ const ChartsAndLink: React.FC = () => {
                     strokeWidth={series.id === activeWeeklyRecordId ? 3 : 2}
                   />
                 ))}
-                <Line
-                  type="monotone"
-                  dataKey="combinedTheta"
-                  name="Combined Theta/Day"
-                  yAxisId="theta"
-                  stroke="#111111"
-                  strokeDasharray="6 4"
-                  dot={false}
-                  connectNulls
-                  strokeWidth={2}
-                />
               </LineChart>
             </ResponsiveContainer>
           )
@@ -1807,17 +1688,16 @@ const ChartsAndLink: React.FC = () => {
                   tick={{ fontSize: 11 }}
                   tickFormatter={(v: number) => v.toFixed(2)}
                 />
-                <YAxis
-                  yAxisId="theta"
-                  orientation="right"
-                  tick={{ fontSize: 11 }}
-                  tickFormatter={(v: number) => v.toFixed(3)}
-                />
                 <Tooltip
                   content={({ active, payload, label }) => {
                     if (!active || !payload || payload.length === 0) {
                       return null;
                     }
+
+                    const labelDate = String(label);
+                    const tooltipPoint = pivotGridChartState.data.find(
+                      (point) => String(point.date) === labelDate
+                    );
 
                     return (
                       <div
@@ -1836,6 +1716,11 @@ const ChartsAndLink: React.FC = () => {
                               const dataKey = item.dataKey ?? "";
                               const numericValue = Number(item.value);
                               const currentValue = toChartValue(Number.isFinite(numericValue) ? numericValue : null);
+                              const thetaRaw = dataKey ? tooltipPoint?.[`${dataKey}_theta`] : null;
+                              const thetaValue =
+                                typeof thetaRaw === "number" && Number.isFinite(thetaRaw)
+                                  ? thetaRaw
+                                  : null;
                               const startValue = dataKey
                                 ? toChartValue(pivotGridChartState.startValues[dataKey] ?? null)
                                 : null;
@@ -1853,6 +1738,7 @@ const ChartsAndLink: React.FC = () => {
                                 name: item.name ?? dataKey,
                                 color: item.color ?? "#595959",
                                 currentValue,
+                                thetaValue,
                                 startValue,
                                 change,
                                 percentChange,
@@ -1877,6 +1763,7 @@ const ChartsAndLink: React.FC = () => {
                                 <tr>
                                   <th style={{ textAlign: "left", paddingBottom: 4 }}>Series</th>
                                   <th style={{ textAlign: "right", paddingBottom: 4 }}>Value</th>
+                                  <th style={{ textAlign: "right", paddingBottom: 4 }}>Theta</th>
                                   <th style={{ textAlign: "right", paddingBottom: 4 }}>Start</th>
                                   <th style={{ textAlign: "right", paddingBottom: 4 }}>Change</th>
                                   <th style={{ textAlign: "right", paddingBottom: 4 }}>%</th>
@@ -1902,6 +1789,17 @@ const ChartsAndLink: React.FC = () => {
                                     <tr key={row.key}>
                                       <td style={{ color: row.color, padding: "2px 0" }}>{row.name}</td>
                                       <td style={{ textAlign: "right", padding: "2px 0" }}>{row.currentValue !== null ? row.currentValue.toFixed(2) : "-"}</td>
+                                      <td
+                                        style={{
+                                          textAlign: "right",
+                                          padding: "2px 0",
+                                          color: "#d97706",
+                                          fontFamily: "Consolas, 'Courier New', monospace",
+                                          fontWeight: 600,
+                                        }}
+                                      >
+                                        {row.thetaValue !== null ? row.thetaValue.toFixed(4) : "-"}
+                                      </td>
                                       <td style={{ textAlign: "right", padding: "2px 0" }}>{row.startValue !== null ? row.startValue.toFixed(2) : "-"}</td>
                                       <td style={{ textAlign: "right", color: changeColor, padding: "2px 0" }}>{signedChange}</td>
                                       <td style={{ textAlign: "right", color: changeColor, padding: "2px 0" }}>{signedPercent}</td>
@@ -1923,12 +1821,10 @@ const ChartsAndLink: React.FC = () => {
                     type="monotone"
                     dataKey={series.key}
                     name={series.name}
-                    yAxisId={series.key === "combinedTheta" ? "theta" : undefined}
                     stroke={OPTION_SERIES_COLORS[index % OPTION_SERIES_COLORS.length]}
                     dot={false}
                     strokeWidth={series.key === "result" ? 3 : 2}
                     connectNulls
-                    strokeDasharray={series.key === "combinedTheta" ? "6 4" : undefined}
                   />
                 ))}
               </LineChart>
