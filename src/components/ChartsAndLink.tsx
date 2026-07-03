@@ -12,7 +12,7 @@ import {
 } from "recharts";
 import dayjs, { type Dayjs } from "dayjs";
 import spyClosingData from "../assets/spy-closing.json";
-import { fetchOptionOpenClose } from "../api/backtest";
+import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 
 const { Title, Link } = Typography;
 
@@ -108,6 +108,9 @@ const TRADE_LINKS: TradeLink[] = [
 const FIXED_DEFAULT_CURRENT_DATE = dayjs("2025-01-02");
 const FIXED_DEFAULT_EXPIRY_DATE = dayjs("2025-12-19");
 const formatExpiryDate = (dateValue: Dayjs) => dateValue.format("YYMMDD");
+const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
+const toChartValue = (value: number | null | undefined): number | null =>
+  typeof value === "number" && Number.isFinite(value) && value !== 0 ? value : null;
 const getRollDateFromExpiry = (expiryDateIso: string): Dayjs | null => {
   const expiry = dayjs(expiryDateIso);
   if (!expiry.isValid()) {
@@ -160,6 +163,8 @@ const ChartsAndLink: React.FC = () => {
   const [expiryDate, setExpiryDate] = useState<Dayjs | null>(FIXED_DEFAULT_EXPIRY_DATE);
   const [optionType, setOptionType] = useState<OptionType>("Put");
   const [strikePrice, setStrikePrice] = useState<number | null>(600);
+  const [previousClosePrice, setPreviousClosePrice] = useState<number | null>(null);
+  const [previousCloseLoading, setPreviousCloseLoading] = useState(false);
   const [optionQuoteLoading, setOptionQuoteLoading] = useState(false);
   const [selectedOptionQuote, setSelectedOptionQuote] = useState<SelectedOptionQuote | null>(null);
   const [weeklyCloseLoading, setWeeklyCloseLoading] = useState(false);
@@ -717,6 +722,65 @@ const ChartsAndLink: React.FC = () => {
     }
   };
 
+  const handleApplyDynamicStrike = (percentOffset: number) => {
+    if (typeof previousClosePrice !== "number" || !Number.isFinite(previousClosePrice)) {
+      message.warning("Fetch previous close first");
+      return;
+    }
+
+    const directionalMultiplier =
+      optionType === "Call"
+        ? 1 + percentOffset / 100
+        : 1 - percentOffset / 100;
+
+    const computedStrike = roundToNearestFive(previousClosePrice * directionalMultiplier);
+    setStrikePrice(computedStrike);
+  };
+
+  const handleGetPreviousCloseFromApi = async () => {
+    if (!selectedSymbol) {
+      message.warning("Select ticker first");
+      return;
+    }
+
+    if (!currentDate || !currentDate.isValid()) {
+      message.warning("Select current date");
+      return;
+    }
+
+    setPreviousCloseLoading(true);
+    try {
+      let cursor = currentDate.subtract(1, "day");
+      let fetchedPrice: number | null = null;
+      let fetchedDate: string | null = null;
+
+      for (let attempt = 0; attempt < 15; attempt += 1) {
+        const quoteDate = cursor.format("YYYY-MM-DD");
+        const response = await fetchStockOpenClose(selectedSymbol, quoteDate);
+
+        if (response.statusCode === 200 && typeof response.closePrice === "number" && Number.isFinite(response.closePrice)) {
+          fetchedPrice = response.closePrice;
+          fetchedDate = quoteDate;
+          break;
+        }
+
+        cursor = cursor.subtract(1, "day");
+      }
+
+      if (fetchedPrice === null || fetchedDate === null) {
+        message.warning("No previous close found from API in recent dates");
+        return;
+      }
+
+      setPreviousClosePrice(fetchedPrice);
+      message.success(`Previous close fetched: ${selectedSymbol} ${fetchedDate} = ${fetchedPrice.toFixed(2)}`);
+    } catch {
+      message.error("Failed to fetch previous close from API");
+    } finally {
+      setPreviousCloseLoading(false);
+    }
+  };
+
   const handleGetWeeklyClosingPrices = async () => {
     const selectedRequest = getSelectedOptionRequest();
     if (!selectedRequest) {
@@ -779,7 +843,7 @@ const ChartsAndLink: React.FC = () => {
 
   const chartData = spyClosingData.map((d) => ({
     date: d.date,
-    close: d.close,
+    close: toChartValue(d.close),
   }));
 
   const chartRecords = React.useMemo(() => {
@@ -804,7 +868,7 @@ const ChartsAndLink: React.FC = () => {
       const seriesKey = `series_${index + 1}`;
       record.rows.forEach((row) => {
         const existing = dateMap.get(row.date) ?? { date: row.date };
-        existing[seriesKey] = row.closePrice;
+        existing[seriesKey] = toChartValue(row.closePrice);
         dateMap.set(row.date, existing);
       });
     });
@@ -947,7 +1011,7 @@ const ChartsAndLink: React.FC = () => {
 
   const pivotGridChartState = React.useMemo(() => {
     const chartEndDate = dayjs("2026-06-30");
-    const excludedChartDates = new Set([
+    const excludedChartDates = new  Set([
       "2025-01-09",
       "2025-02-20",
       "2025-04-24",
@@ -967,17 +1031,8 @@ const ChartsAndLink: React.FC = () => {
       { key: "pair_6", name: "Col11 + Col12", leftKey: "dataset_11", rightKey: "dataset_12" },
     ] as Array<{ key: string; name: string; leftKey: string; rightKey: string }>;
 
-    const spyCloseByDate = new Map<string, number>();
-    const sortedSpyRows = [...spyClosingData].sort((left, right) => left.date.localeCompare(right.date));
-    sortedSpyRows.forEach((row) => {
-      if (typeof row.close === "number" && Number.isFinite(row.close)) {
-        spyCloseByDate.set(row.date, row.close);
-      }
-    });
-
     const chartSeries = [
       ...pairedSeries.map((seriesItem) => ({ key: seriesItem.key, name: seriesItem.name })),
-      { key: "spy_close", name: "SPY Closing Price" },
     ];
 
     const data = pivotTableState.rows
@@ -994,17 +1049,19 @@ const ChartsAndLink: React.FC = () => {
         pairedSeries.forEach((seriesItem) => {
           const leftValue = Number(row[seriesItem.leftKey]);
           const rightValue = Number(row[seriesItem.rightKey]);
-          dataPoint[seriesItem.key] =
-            Number.isFinite(leftValue) && Number.isFinite(rightValue)
+          const isCol1ToCol6Pair =
+            (seriesItem.leftKey === "dataset_1" || seriesItem.leftKey === "dataset_3" || seriesItem.leftKey === "dataset_5") &&
+            (seriesItem.rightKey === "dataset_2" || seriesItem.rightKey === "dataset_4" || seriesItem.rightKey === "dataset_6");
+
+          const hasBothFinite = Number.isFinite(leftValue) && Number.isFinite(rightValue);
+          const hasAnyZeroOrNullForCol1ToCol6 = isCol1ToCol6Pair && (!hasBothFinite || leftValue === 0 || rightValue === 0);
+
+          const pairValue =
+            hasBothFinite && !hasAnyZeroOrNullForCol1ToCol6
               ? Number((leftValue + rightValue).toFixed(4))
               : null;
+          dataPoint[seriesItem.key] = toChartValue(pairValue);
         });
-
-        const spyClose = spyCloseByDate.get(row.date);
-        dataPoint.spy_close =
-          typeof spyClose === "number" && Number.isFinite(spyClose)
-            ? Number(spyClose.toFixed(4))
-            : null;
 
         return dataPoint;
       });
@@ -1246,6 +1303,25 @@ const ChartsAndLink: React.FC = () => {
               style={{ width: 140 }}
             />
           </Form.Item>
+          <Form.Item label="Quick Strike">
+            <Space size={6} wrap>
+              <Button onClick={() => handleApplyDynamicStrike(0)}>ATM</Button>
+              <Button onClick={() => handleApplyDynamicStrike(1)}>
+                {optionType === "Call" ? "+1%" : "-1%"}
+              </Button>
+              <Button onClick={() => handleApplyDynamicStrike(5)}>
+                {optionType === "Call" ? "+5%" : "-5%"}
+              </Button>
+              <Button onClick={() => handleApplyDynamicStrike(10)}>
+                {optionType === "Call" ? "+10%" : "-10%"}
+              </Button>
+            </Space>
+          </Form.Item>
+          <Form.Item label=" ">
+            <Button onClick={() => void handleGetPreviousCloseFromApi()} loading={previousCloseLoading}>
+              Get Previous Close (API)
+            </Button>
+          </Form.Item>
           <Form.Item label=" ">
             <Button onClick={() => void handleGetOptionPriceForSelectedDate()} loading={optionQuoteLoading}>
               Get Option Price
@@ -1278,6 +1354,12 @@ const ChartsAndLink: React.FC = () => {
               Theta: {selectedOptionQuote.theta !== null ? selectedOptionQuote.theta.toFixed(4) : "-"}
             </Typography.Text>
           </Space>
+        )}
+
+        {previousClosePrice !== null && (
+          <Typography.Text type="secondary" style={{ display: "block", marginTop: 8 }}>
+            Previous Close (API): {previousClosePrice.toFixed(2)}
+          </Typography.Text>
         )}
 
         {savedWeeklyCloseRecords.length > 0 && (
@@ -1343,8 +1425,8 @@ const ChartsAndLink: React.FC = () => {
                 <Tooltip
                   formatter={(v) => {
                     const numericValue = typeof v === "number" ? v : Number(v);
-                    const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
-                    return [`$${safeValue.toFixed(2)}`, "Close"];
+                    const safeValue = toChartValue(Number.isFinite(numericValue) ? numericValue : null);
+                    return [safeValue !== null ? `$${safeValue.toFixed(2)}` : "-", "Close"];
                   }}
                 />
                 <Legend />
@@ -1439,8 +1521,10 @@ const ChartsAndLink: React.FC = () => {
                             .map((item) => {
                               const dataKey = item.dataKey ?? "";
                               const numericValue = Number(item.value);
-                              const currentValue = Number.isFinite(numericValue) ? numericValue : null;
-                              const startValue = dataKey ? pivotGridChartState.startValues[dataKey] ?? null : null;
+                              const currentValue = toChartValue(Number.isFinite(numericValue) ? numericValue : null);
+                              const startValue = dataKey
+                                ? toChartValue(pivotGridChartState.startValues[dataKey] ?? null)
+                                : null;
                               const change =
                                 currentValue !== null && startValue !== null
                                   ? Number((currentValue - startValue).toFixed(2))
@@ -1555,8 +1639,8 @@ const ChartsAndLink: React.FC = () => {
             <Tooltip
               formatter={(v) => {
                 const numericValue = typeof v === "number" ? v : Number(v);
-                const safeValue = Number.isFinite(numericValue) ? numericValue : 0;
-                return [`$${safeValue.toFixed(2)}`, "Close"];
+                const safeValue = toChartValue(Number.isFinite(numericValue) ? numericValue : null);
+                return [safeValue !== null ? `$${safeValue.toFixed(2)}` : "-", "Close"];
               }}
             />
             <Line

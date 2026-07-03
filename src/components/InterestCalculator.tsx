@@ -33,6 +33,9 @@ interface AnalysisRow {
 	daysToExpiry: number;
 	interestPercentage: number | null;
 	annualInterestRate: number | null;
+	thetaPerDay: number | null;
+	intrinsicValue: number | null;
+	extrinsicValue: number | null;
 	statusCode: number | null;
 }
 
@@ -45,6 +48,120 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
 
 const formatExpiryDate = (dateStr: string): string => dayjs(dateStr).format("YYMMDD");
+const SQRT_TWO_PI = Math.sqrt(2 * Math.PI);
+
+const normalPdf = (x: number): number => Math.exp(-0.5 * x * x) / SQRT_TWO_PI;
+
+const normalCdf = (x: number): number => {
+	const sign = x < 0 ? -1 : 1;
+	const absX = Math.abs(x) / Math.sqrt(2);
+	const t = 1 / (1 + 0.3275911 * absX);
+	const a1 = 0.254829592;
+	const a2 = -0.284496736;
+	const a3 = 1.421413741;
+	const a4 = -1.453152027;
+	const a5 = 1.061405429;
+	const erfApprox =
+		1 -
+		(((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) *
+			Math.exp(-absX * absX);
+
+	return 0.5 * (1 + sign * erfApprox);
+};
+
+const blackScholesPrice = (
+	spot: number,
+	strike: number,
+	timeYears: number,
+	sigma: number,
+	optionType: OptionType
+): number => {
+	if (timeYears <= 0 || sigma <= 0 || spot <= 0 || strike <= 0) {
+		return optionType === "C" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+	}
+
+	const sqrtT = Math.sqrt(timeYears);
+	const d1 = (Math.log(spot / strike) + 0.5 * sigma * sigma * timeYears) / (sigma * sqrtT);
+	const d2 = d1 - sigma * sqrtT;
+
+	if (optionType === "C") {
+		return spot * normalCdf(d1) - strike * normalCdf(d2);
+	}
+
+	return strike * normalCdf(-d2) - spot * normalCdf(-d1);
+};
+
+const estimateImpliedVolatility = (
+	marketPrice: number,
+	spot: number,
+	strike: number,
+	timeYears: number,
+	optionType: OptionType
+): number | null => {
+	if (marketPrice <= 0 || spot <= 0 || strike <= 0 || timeYears <= 0) {
+		return null;
+	}
+
+	const intrinsic = optionType === "C" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+	const targetPrice = Math.max(marketPrice, intrinsic + 1e-8);
+
+	let low = 1e-4;
+	let high = 5;
+
+	for (let i = 0; i < 80; i += 1) {
+		const mid = (low + high) / 2;
+		const modelPrice = blackScholesPrice(spot, strike, timeYears, mid, optionType);
+
+		if (Math.abs(modelPrice - targetPrice) < 1e-5) {
+			return mid;
+		}
+
+		if (modelPrice > targetPrice) {
+			high = mid;
+		} else {
+			low = mid;
+		}
+	}
+
+	return (low + high) / 2;
+};
+
+const calculateThetaPerDay = (
+	optionPrice: number | null,
+	stockPrice: number | null,
+	strike: number,
+	asOfDate: string,
+	expiryDate: string,
+	optionType: OptionType
+): number | null => {
+	if (
+		optionPrice === null ||
+		stockPrice === null ||
+		!Number.isFinite(optionPrice) ||
+		!Number.isFinite(stockPrice) ||
+		strike <= 0
+	) {
+		return null;
+	}
+
+	const daysToExpiry = dayjs(expiryDate).diff(dayjs(asOfDate), "day");
+	if (daysToExpiry <= 0) {
+		return null;
+	}
+
+	const timeYears = daysToExpiry / 365;
+	const impliedVol = estimateImpliedVolatility(optionPrice, stockPrice, strike, timeYears, optionType);
+	if (impliedVol === null) {
+		return null;
+	}
+
+	const sqrtT = Math.sqrt(timeYears);
+	const d1 = (Math.log(stockPrice / strike) + 0.5 * impliedVol * impliedVol * timeYears) /
+		(impliedVol * sqrtT);
+	const thetaPerYear = -(stockPrice * normalPdf(d1) * impliedVol) / (2 * sqrtT);
+
+	return thetaPerYear / 365;
+};
 
 const formatCurrency = (value: number | null) => {
 	if (value === null || !Number.isFinite(value)) {
@@ -135,6 +252,9 @@ const InterestCalculator: React.FC = () => {
 			daysToExpiry: dayjs(rowExpiryDate).diff(dayjs(startDate), "day"),
 			interestPercentage: null,
 			annualInterestRate: null,
+			thetaPerDay: null,
+			intrinsicValue: null,
+			extrinsicValue: null,
 			statusCode: null,
 		}));
 
@@ -158,6 +278,22 @@ const InterestCalculator: React.FC = () => {
 				interestPercentage !== null && seededRow.daysToExpiry > 0
 					? interestPercentage * (365 / seededRow.daysToExpiry)
 					: null;
+			const thetaPerDay = calculateThetaPerDay(
+				optionClose,
+				seededRow.stockClose,
+				seededRow.strikePrice,
+				seededRow.date,
+				seededRow.expiryDate,
+				optionType
+			);
+			const intrinsicValue =
+				optionClose !== null && seededRow.stockClose !== null
+					? optionType === "C"
+						? Math.max(seededRow.stockClose - seededRow.strikePrice, 0)
+						: Math.max(seededRow.strikePrice - seededRow.stockClose, 0)
+					: null;
+			const extrinsicValue =
+				optionClose !== null && intrinsicValue !== null ? Math.max(optionClose - intrinsicValue, 0) : null;
 
 			setRows((previousRows) =>
 				previousRows.map((row) =>
@@ -167,6 +303,9 @@ const InterestCalculator: React.FC = () => {
 							optionClose,
 							interestPercentage,
 							annualInterestRate,
+							thetaPerDay,
+							intrinsicValue,
+							extrinsicValue,
 							statusCode: optionData.statusCode,
 						}
 						: row
@@ -392,17 +531,24 @@ const InterestCalculator: React.FC = () => {
 							dataIndex: "daysToExpiry",
 							key: "daysToExpiry",
 						},
+					
 						{
-							title: "Interest %",
-							dataIndex: "interestPercentage",
-							key: "interestPercentage",
-							render: (value: number | null) => formatPercent(value),
+							title: "Theta / day",
+							dataIndex: "thetaPerDay",
+							key: "thetaPerDay",
+							render: (value: number | null) => formatCurrency(value),
 						},
 						{
-							title: "Annual interest rate",
-							dataIndex: "annualInterestRate",
-							key: "annualInterestRate",
-							render: (value: number | null) => formatPercent(value),
+							title: "Intrinsic",
+							dataIndex: "intrinsicValue",
+							key: "intrinsicValue",
+							render: (value: number | null) => formatCurrency(value),
+						},
+						{
+							title: "Extrinsic",
+							dataIndex: "extrinsicValue",
+							key: "extrinsicValue",
+							render: (value: number | null) => formatCurrency(value),
 						},
 						// {
 						// 	title: "API status",

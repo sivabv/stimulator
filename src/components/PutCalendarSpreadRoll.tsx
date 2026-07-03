@@ -92,14 +92,6 @@ interface RollingOptionCandidate {
   netCreditDebit: number | null;
 }
 
-interface PauseCheckpointData {
-  processedCount: number;
-  date: string;
-  rollNumber: number;
-  closingPrice: number | null;
-  cumulativePnl: number | null;
-}
-
 interface AutoSavedOptionCheckpoint {
   date: string;
   shortPutPrice: number | null;
@@ -119,7 +111,6 @@ const LONG_EXPIRY_MIN_DTE_DAYS = 150;
 const LONG_EXPIRY_MAX_DTE_DAYS = 400;
 const MIN_AUTO_ROLL_CREDIT = 1.25;
 const AUTO_ROLL_MAX_STRIKE_STEPS = 8;
-const AUTO_PAUSE_EVERY_SIMULATIONS = 5;
 
 const tradingDates = (tradingDatesJson as string[])
   .filter((value) => dayjs(value).isValid())
@@ -128,6 +119,111 @@ const tradingDates = (tradingDatesJson as string[])
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
 const formatExpiryDate = (dateStr: string): string => dayjs(dateStr).format("YYMMDD");
+const SQRT_TWO_PI = Math.sqrt(2 * Math.PI);
+
+const normalPdf = (x: number): number => Math.exp(-0.5 * x * x) / SQRT_TWO_PI;
+
+const normalCdf = (x: number): number => {
+  const sign = x < 0 ? -1 : 1;
+  const absX = Math.abs(x) / Math.sqrt(2);
+  const t = 1 / (1 + 0.3275911 * absX);
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const erfApprox =
+    1 -
+    (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) *
+      Math.exp(-absX * absX);
+  return 0.5 * (1 + sign * erfApprox);
+};
+
+const blackScholesPrice = (
+  spot: number,
+  strike: number,
+  timeYears: number,
+  sigma: number,
+  optionType: "C" | "P"
+): number => {
+  if (timeYears <= 0 || sigma <= 0 || spot <= 0 || strike <= 0) {
+    return optionType === "C" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+  }
+
+  const sqrtT = Math.sqrt(timeYears);
+  const d1 = (Math.log(spot / strike) + 0.5 * sigma * sigma * timeYears) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+
+  if (optionType === "C") {
+    return spot * normalCdf(d1) - strike * normalCdf(d2);
+  }
+  return strike * normalCdf(-d2) - spot * normalCdf(-d1);
+};
+
+const estimateImpliedVolatility = (
+  marketPrice: number,
+  spot: number,
+  strike: number,
+  timeYears: number,
+  optionType: "C" | "P"
+): number | null => {
+  if (marketPrice <= 0 || spot <= 0 || strike <= 0 || timeYears <= 0) return null;
+
+  const intrinsic = optionType === "C" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+  const target = Math.max(marketPrice, intrinsic + 1e-8);
+
+  let low = 1e-4;
+  let high = 5;
+
+  for (let i = 0; i < 80; i += 1) {
+    const mid = (low + high) / 2;
+    const modelPrice = blackScholesPrice(spot, strike, timeYears, mid, optionType);
+    if (Math.abs(modelPrice - target) < 1e-5) {
+      return mid;
+    }
+    if (modelPrice > target) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+
+  return (low + high) / 2;
+};
+
+const calculateThetaPerDay = (
+  optionPrice: number | null,
+  stockPrice: number | null,
+  strike: number,
+  asOfDate: string,
+  expiryDate: string,
+  optionType: "C" | "P"
+): number | null => {
+  if (
+    optionPrice === null ||
+    stockPrice === null ||
+    !Number.isFinite(optionPrice) ||
+    !Number.isFinite(stockPrice) ||
+    strike <= 0
+  ) {
+    return null;
+  }
+
+  const daysToExpiry = dayjs(expiryDate).diff(dayjs(asOfDate), "day");
+  if (daysToExpiry <= 0) return null;
+
+  const timeYears = daysToExpiry / 365;
+  const impliedVol = estimateImpliedVolatility(optionPrice, stockPrice, strike, timeYears, optionType);
+  if (impliedVol === null) return null;
+
+  const sqrtT = Math.sqrt(timeYears);
+  const d1 = (Math.log(stockPrice / strike) + 0.5 * impliedVol * impliedVol * timeYears) /
+    (impliedVol * sqrtT);
+
+  const thetaPerYear = -(stockPrice * normalPdf(d1) * impliedVol) / (2 * sqrtT);
+  return thetaPerYear / 365;
+};
+
 const buildStrikeCandidates = (baseStrike: number, maxSteps: number): number[] => {
   const candidates: number[] = [roundToNearestFive(baseStrike)];
   for (let step = 1; step <= maxSteps; step += 1) {
@@ -270,13 +366,13 @@ const PutCalendarSpreadRoll: React.FC = () => {
   const [putLegModalData, setPutLegModalData] = useState<PutLegModalData | null>(null);
   const [rollingOptionsLoading, setRollingOptionsLoading] = useState(false);
   const [rollingOptions, setRollingOptions] = useState<RollingOptionCandidate[]>([]);
-  const [isPaused, setIsPaused] = useState(false);
   const [processedSimulationCount, setProcessedSimulationCount] = useState(0);
-  const [pausePromptOpen, setPausePromptOpen] = useState(false);
-  const [pauseCheckpointData, setPauseCheckpointData] = useState<PauseCheckpointData | null>(null);
   const [autoSavedCheckpoint, setAutoSavedCheckpoint] = useState<AutoSavedOptionCheckpoint | null>(
     loadAutoSavedCheckpoint()
   );
+  const [showSummary, setShowSummary] = useState(true);
+  const [showChart, setShowChart] = useState(true);
+  const [showGrid, setShowGrid] = useState(true);
 
   const [summary, setSummary] = useState<{
     startDate: string;
@@ -294,32 +390,6 @@ const PutCalendarSpreadRoll: React.FC = () => {
   const stockInFlightRef = useRef<Map<string, Promise<CachedStockPrice>>>(new Map());
   const optionCacheRef = useRef<Record<string, OptionOpenClose>>({});
   const optionInFlightRef = useRef<Map<string, Promise<OptionOpenClose>>>(new Map());
-  const pauseDecisionResolverRef = useRef<((shouldContinue: boolean) => void) | null>(null);
-  const manualPauseRequestedRef = useRef(false);
-
-  const setPauseState = (value: boolean) => {
-    setIsPaused(value);
-  };
-
-  const openPausePrompt = (checkpointData: PauseCheckpointData): Promise<boolean> => {
-    setPauseCheckpointData(checkpointData);
-    setPausePromptOpen(true);
-    setPauseState(true);
-
-    return new Promise<boolean>((resolve) => {
-      pauseDecisionResolverRef.current = resolve;
-    });
-  };
-
-  const resolvePauseDecision = (shouldContinue: boolean) => {
-    setPausePromptOpen(false);
-    setPauseState(false);
-    manualPauseRequestedRef.current = false;
-    if (pauseDecisionResolverRef.current) {
-      pauseDecisionResolverRef.current(shouldContinue);
-      pauseDecisionResolverRef.current = null;
-    }
-  };
 
   const fetchWithRateLimitRetry = async <T extends { statusCode: number | null }>(
     work: () => Promise<T>
@@ -448,6 +518,20 @@ const PutCalendarSpreadRoll: React.FC = () => {
     setRollPreview(null);
     setRollModalOpen(true);
     void previewManualRoll(row, defaultRollExpiryDate, row.strike);
+  };
+
+  const applyDynamicRollStrike = (row: PutCalendarRow, percentOffset: number) => {
+    if (typeof row.closingPrice !== "number" || !Number.isFinite(row.closingPrice)) {
+      message.warning("No closing price available to calculate strike");
+      return;
+    }
+
+    const computedStrike = roundToNearestFive(row.closingPrice * (1 - percentOffset / 100));
+    setRollStrike(computedStrike);
+
+    if (rollExpiryDate) {
+      void previewManualRoll(row, rollExpiryDate, computedStrike);
+    }
   };
 
   const openPutLegModal = (row: PutCalendarRow, legType: "Short Put" | "Long Put") => {
@@ -597,10 +681,6 @@ const PutCalendarSpreadRoll: React.FC = () => {
     setSummary(null);
     setLoading(true);
     setProcessedSimulationCount(0);
-    setPauseState(false);
-    setPausePromptOpen(false);
-    setPauseCheckpointData(null);
-    manualPauseRequestedRef.current = false;
 
     try {
       const symbol = stockTicker.trim().toUpperCase();
@@ -707,7 +787,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
       let activeStrike = openingStrike;
       let rollNumber = 0;
       let entryNetCredit: number | null = null;
-      let entryShortPutPrice: number | null = null;
+      let simulationStartShortPutPrice: number | null = null;
       let realisedPnl = 0;
       let autoRollStoppedReason: string | null = null;
 
@@ -721,7 +801,6 @@ const PutCalendarSpreadRoll: React.FC = () => {
           activeShortExpiryDate = rollForToday.shortExpiryDate;
           activeStrike = roundToNearestFive(rollForToday.strike);
           entryNetCredit = null;
-          entryShortPutPrice = null;
           rollNumber += 1;
           realisedPnl += rollForToday.rollCreditDebit ?? 0;
         }
@@ -757,8 +836,8 @@ const PutCalendarSpreadRoll: React.FC = () => {
         if (entryNetCredit === null) {
           entryNetCredit = currentNetCloseCost;
         }
-        if (entryShortPutPrice === null) {
-          entryShortPutPrice = shortPutPrice;
+        if (simulationStartShortPutPrice === null) {
+          simulationStartShortPutPrice = shortPutPrice;
         }
 
         const isExpiry = dayjs(date).isSame(dayjs(activeShortExpiryDate), "day");
@@ -806,24 +885,6 @@ const PutCalendarSpreadRoll: React.FC = () => {
         const processedCount = allRows.length;
         setProcessedSimulationCount(processedCount);
 
-        const shouldAutoPause = processedCount % AUTO_PAUSE_EVERY_SIMULATIONS === 0;
-        const shouldManualPause = manualPauseRequestedRef.current;
-
-        if (shouldAutoPause || shouldManualPause) {
-          const shouldContinue = await openPausePrompt({
-            processedCount,
-            date,
-            rollNumber,
-            closingPrice: closePrice,
-            cumulativePnl: realisedPnl + unrealisedPnl,
-          });
-
-          if (!shouldContinue) {
-            autoRollStoppedReason = `Simulation stopped by user after ${processedCount} simulations on ${date}.`;
-            break;
-          }
-        }
-
         if (isExpiry) {
           autoRollStoppedReason =
             `Simulation stopped at short expiry ${activeShortExpiryDate} on ${date}.`;
@@ -832,11 +893,14 @@ const PutCalendarSpreadRoll: React.FC = () => {
 
         if (autoRollWeeklyEnabled) {
           const meetsAutoRollDecayCondition =
-            entryShortPutPrice !== null &&
+            simulationStartShortPutPrice !== null &&
             shortPutPrice !== null &&
-            shortPutPrice <= entryShortPutPrice * 0.5;
+            shortPutPrice <= simulationStartShortPutPrice * 0.5;
 
-          if (!meetsAutoRollDecayCondition) {
+          const daysUntilExpiry = dayjs(activeShortExpiryDate).diff(dayjs(date), "day");
+          const isNearExpiry = daysUntilExpiry >= 0 && daysUntilExpiry < 10;
+
+          if (!meetsAutoRollDecayCondition && !isNearExpiry) {
             continue;
           }
 
@@ -938,12 +1002,6 @@ const PutCalendarSpreadRoll: React.FC = () => {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to run put calendar spread simulation");
     } finally {
-      setPausePromptOpen(false);
-      setPauseState(false);
-      if (pauseDecisionResolverRef.current) {
-        pauseDecisionResolverRef.current(false);
-        pauseDecisionResolverRef.current = null;
-      }
       setLoading(false);
     }
   };
@@ -1047,19 +1105,6 @@ const PutCalendarSpreadRoll: React.FC = () => {
             Run Put Calendar Spread
           </Button>
           <Button
-            onClick={() => {
-              if (isPaused && pausePromptOpen) {
-                resolvePauseDecision(true);
-              } else {
-                manualPauseRequestedRef.current = true;
-                message.info("Pause requested. Simulation will ask to continue at the next checkpoint.");
-              }
-            }}
-            disabled={!loading}
-          >
-            {isPaused ? "Continue" : "Pause"}
-          </Button>
-          <Button
             type={autoRollWeeklyEnabled ? "primary" : "default"}
             onClick={() => setAutoRollWeeklyEnabled((previous) => !previous)}
             disabled={loading}
@@ -1067,8 +1112,19 @@ const PutCalendarSpreadRoll: React.FC = () => {
             Auto Roll Weekly: {autoRollWeeklyEnabled ? "ON" : "OFF"}
           </Button>
         </Space>
+        <Space style={{ marginTop: 12 }} wrap>
+          <Button onClick={() => setShowSummary((previous) => !previous)}>
+            {showSummary ? "Hide Summary" : "Show Summary"}
+          </Button>
+          <Button onClick={() => setShowChart((previous) => !previous)}>
+            {showChart ? "Hide Chart" : "Show Chart"}
+          </Button>
+          <Button onClick={() => setShowGrid((previous) => !previous)}>
+            {showGrid ? "Hide Grid" : "Show Grid"}
+          </Button>
+        </Space>
         <Text type="secondary" style={{ display: "block", marginTop: 8 }}>
-          Auto pause every {AUTO_PAUSE_EVERY_SIMULATIONS} simulations with continue confirmation. Processed: {processedSimulationCount}
+          Processed simulations: {processedSimulationCount}
         </Text>
         <Text type="secondary" style={{ display: "block", marginTop: 4 }}>
           Auto-saved checkpoint: {autoSavedCheckpoint?.date ?? "-"} | Short Put {formatCurrency(autoSavedCheckpoint?.shortPutPrice ?? null)} | Long Put {formatCurrency(autoSavedCheckpoint?.longPutPrice ?? null)}
@@ -1077,7 +1133,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
 
       {error && <Alert type="error" showIcon message="Put Calendar Spread Error" description={error} />}
 
-      {summary && (
+      {summary && showSummary && (
         <Card title="Summary">
           <Row gutter={[24, 8]}>
             <Col xs={24} sm={8}>
@@ -1116,159 +1172,235 @@ const PutCalendarSpreadRoll: React.FC = () => {
         </Card>
       )}
 
-      <Card title="Option Price Chart">
-        {optionPriceChartData.length === 0 ? (
-          <Text type="secondary">Run the simulation to view option prices by date.</Text>
-        ) : (
-          <div style={{ width: "100%", height: 320 }}>
-            <ResponsiveContainer>
-              <LineChart data={optionPriceChartData} margin={{ top: 16, right: 16, left: 8, bottom: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="date" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="shortPutPrice"
-                  name="Short Put Price"
-                  stroke="#cf1322"
-                  strokeWidth={2}
-                  dot={false}
-                  connectNulls={false}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="longPutPrice"
-                  name="Long Put Price"
-                  stroke="#0958d9"
-                  strokeWidth={2}
-                  dot={false}
-                  connectNulls={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        )}
-      </Card>
+      {showChart && (
+        <Card title="Option Price Chart">
+          {optionPriceChartData.length === 0 ? (
+            <Text type="secondary">Run the simulation to view option prices by date.</Text>
+          ) : (
+            <div style={{ width: "100%", height: 320 }}>
+              <ResponsiveContainer>
+                <LineChart data={optionPriceChartData} margin={{ top: 16, right: 16, left: 8, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="date" />
+                  <YAxis />
+                  <Tooltip />
+                  <Legend />
+                  <Line
+                    type="monotone"
+                    dataKey="shortPutPrice"
+                    name="Short Put Price"
+                    stroke="#cf1322"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="longPutPrice"
+                    name="Long Put Price"
+                    stroke="#0958d9"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </Card>
+      )}
 
-      <Card title="Records">
-        <Table<PutCalendarRow>
-          rowKey="key"
-          loading={loading}
-          dataSource={rows}
-          pagination={{ pageSize: 50, showSizeChanger: true }}
-          scroll={{ x: "max-content" }}
-          columns={[
-            { title: "Roll #", dataIndex: "rollNumber", key: "rollNumber", width: 70 },
-            { title: "Date", dataIndex: "date", key: "date", width: 110 },
-            {
-              title: "Closing Price",
-              dataIndex: "closingPrice",
-              key: "closingPrice",
-              width: 130,
-              render: (v: number | null) => formatCurrency(v),
-            },
-            {
-              title: "Strike",
-              dataIndex: "strike",
-              key: "strike",
-              width: 100,
-              render: (v: number) => formatCurrency(v),
-            },
+      {showGrid && (
+        <Card title="Records">
+          <Table<PutCalendarRow>
+            rowKey="key"
+            loading={loading}
+            dataSource={rows}
+            pagination={{ pageSize: 50, showSizeChanger: true }}
+            scroll={{ x: "max-content" }}
+            columns={[
+            // { title: "Roll #", dataIndex: "rollNumber", key: "rollNumber", width: 70 },
+            // { title: "Date", dataIndex: "date", key: "date", width: 110 },
+            // {
+            //   title: "Closing Price",
+            //   dataIndex: "closingPrice",
+            //   key: "closingPrice",
+            //   width: 130,
+            //   render: (v: number | null) => formatCurrency(v),
+            // },
+            // {
+            //   title: "Strike",
+            //   dataIndex: "strike",
+            //   key: "strike",
+            //   width: 100,
+            //   render: (v: number) => formatCurrency(v),
+            // },
             { title: "Short Expiry", dataIndex: "shortExpiryDate", key: "shortExpiryDate", width: 120 },
-            { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
+            // { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
             {
-              title: "Short Put",
-              dataIndex: "shortPutPrice",
-              key: "shortPutPrice",
-              width: 120,
-              render: (v: number | null, row: PutCalendarRow) =>
-                v !== null ? (
-                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openPutLegModal(row, "Short Put")}>
-                    {formatCurrency(v)}
-                  </Button>
-                ) : (
-                  "-"
-                ),
+              title: "Put Price (Short | Long)",
+              key: "putPriceCombined",
+              width: 260,
+              render: (_: number | null, row: PutCalendarRow) => {
+                const shortPut =
+                  row.shortPutPrice !== null ? (
+                    <Button
+                      type="link"
+                      size="small"
+                      style={{ padding: 0 }}
+                      onClick={() => openPutLegModal(row, "Short Put")}
+                    >
+                      {formatCurrency(row.shortPutPrice)}
+                    </Button>
+                  ) : (
+                    "-"
+                  );
+
+                const longPut =
+                  row.longPutPrice !== null ? (
+                    <Button
+                      type="link"
+                      size="small"
+                      style={{ padding: 0 }}
+                      onClick={() => openPutLegModal(row, "Long Put")}
+                    >
+                      {formatCurrency(row.longPutPrice)}
+                    </Button>
+                  ) : (
+                    "-"
+                  );
+
+                return (
+                  <Space size={4}>
+                    {shortPut}
+                    <Text>|</Text>
+                    {longPut}
+                  </Space>
+                );
+              },
             },
             {
-              title: "Long Put",
-              dataIndex: "longPutPrice",
-              key: "longPutPrice",
-              width: 120,
-              render: (v: number | null, row: PutCalendarRow) =>
-                v !== null ? (
-                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openPutLegModal(row, "Long Put")}>
-                    {formatCurrency(v)}
-                  </Button>
-                ) : (
-                  "-"
-                ),
+              title: "Theta/Day (Short | Long)",
+              key: "thetaPerDay",
+              width: 320,
+              render: (_: number | null, row: PutCalendarRow) => {
+                const shortTheta = calculateThetaPerDay(
+                  row.shortPutPrice,
+                  row.closingPrice,
+                  row.strike,
+                  row.date,
+                  row.shortExpiryDate,
+                  "P"
+                );
+
+                const longTheta = calculateThetaPerDay(
+                  row.longPutPrice,
+                  row.closingPrice,
+                  row.strike,
+                  row.date,
+                  row.longExpiryDate,
+                  "P"
+                );
+
+                const netTheta =
+                  shortTheta !== null && longTheta !== null
+                    ? longTheta - shortTheta
+                    : null;
+
+                const getColor = (value: number | null) => {
+                  if (value === null || !Number.isFinite(value)) {
+                    return undefined;
+                  }
+                  return value >= 0 ? "#3f8600" : "#cf1322";
+                };
+
+                return (
+                  <Space size={4} wrap>
+                    <Text>{formatCurrency(shortTheta)}</Text>
+                    <Text>|</Text>
+                    <Text>{formatCurrency(longTheta)}</Text>
+                    <Text>(</Text>
+                    <Text style={{ color: getColor(netTheta) }}>
+                      {formatCurrency(netTheta)}
+                    </Text>
+                    <Text>)</Text>
+                  </Space>
+                );
+              },
             },
+            // {
+            //   title: "Entry Net Credit",
+            //   dataIndex: "entryNetCredit",
+            //   key: "entryNetCredit",
+            //   width: 140,
+            //   render: (v: number | null) => formatCurrency(v),
+            // },
+            // {
+            //   title: "Close Net Cost",
+            //   dataIndex: "closeNetCost",
+            //   key: "closeNetCost",
+            //   width: 130,
+            //   render: (v: number | null) => (v !== null ? formatCurrency(v) : "-"),
+            // },
+            // {
+            //   title: "Leg P&L",
+            //   dataIndex: "legPnl",
+            //   key: "legPnl",
+            //   width: 110,
+            //   render: (v: number | null) =>
+            //     v !== null ? (
+            //       <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
+            //     ) : (
+            //       "-"
+            //     ),
+            // },
             {
-              title: "Entry Net Credit",
-              dataIndex: "entryNetCredit",
-              key: "entryNetCredit",
-              width: 140,
-              render: (v: number | null) => formatCurrency(v),
+              title: "Cumulative P&L (Roll Credit/Debit)",
+              key: "cumulativeWithRoll",
+              width: 260,
+              render: (_: number | null, row: PutCalendarRow) => {
+                const cumulative = row.cumulativePnl;
+                const roll = row.rollCreditDebit;
+
+                const cumulativeNode =
+                  cumulative !== null ? (
+                    <Text style={{ color: cumulative >= 0 ? "#3f8600" : "#cf1322" }}>
+                      {formatCurrency(cumulative)}
+                    </Text>
+                  ) : (
+                    "-"
+                  );
+
+                const hasRoll = roll !== null;
+                const rollNode = hasRoll ? (
+                  <Text style={{ color: (roll ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                    {formatCurrency(roll)}
+                  </Text>
+                ) : null;
+
+                return (
+                  <Space size={4} wrap>
+                    {cumulativeNode}
+                    {hasRoll ? <Text>(</Text> : null}
+                    {rollNode}
+                    {hasRoll ? <Text>)</Text> : null}
+                  </Space>
+                );
+              },
             },
-            {
-              title: "Close Net Cost",
-              dataIndex: "closeNetCost",
-              key: "closeNetCost",
-              width: 130,
-              render: (v: number | null) => (v !== null ? formatCurrency(v) : "-"),
-            },
-            {
-              title: "Leg P&L",
-              dataIndex: "legPnl",
-              key: "legPnl",
-              width: 110,
-              render: (v: number | null) =>
-                v !== null ? (
-                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
-                ) : (
-                  "-"
-                ),
-            },
-            {
-              title: "Roll Credit/Debit",
-              dataIndex: "rollCreditDebit",
-              key: "rollCreditDebit",
-              width: 140,
-              render: (v: number | null) =>
-                v !== null ? (
-                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
-                ) : (
-                  "-"
-                ),
-            },
-            {
-              title: "Cumulative P&L",
-              dataIndex: "cumulativePnl",
-              key: "cumulativePnl",
-              width: 140,
-              render: (v: number | null) =>
-                v !== null ? (
-                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
-                ) : (
-                  "-"
-                ),
-            },
-            {
-              title: "Status",
-              dataIndex: "status",
-              key: "status",
-              width: 100,
-              render: (v: RowStatus) => statusTag(v),
-              filters: [
-                { text: "Active", value: "active" },
-                { text: "Rolled", value: "rolled" },
-                { text: "Expired", value: "expired" },
-              ],
-              onFilter: (value, record) => record.status === value,
-            },
+            // {
+            //   title: "Status",
+            //   dataIndex: "status",
+            //   key: "status",
+            //   width: 100,
+            //   render: (v: RowStatus) => statusTag(v),
+            //   filters: [
+            //     { text: "Active", value: "active" },
+            //     { text: "Rolled", value: "rolled" },
+            //     { text: "Expired", value: "expired" },
+            //   ],
+            //   onFilter: (value, record) => record.status === value,
+            // },
             {
               title: "Action",
               key: "action",
@@ -1284,9 +1416,10 @@ const PutCalendarSpreadRoll: React.FC = () => {
                 </Space>
               ),
             },
-          ]}
-        />
-      </Card>
+            ]}
+          />
+        </Card>
+      )}
 
       <Modal
         title="Roll Short Put"
@@ -1329,6 +1462,20 @@ const PutCalendarSpreadRoll: React.FC = () => {
               style={{ width: "100%", marginTop: 8 }}
               step={5}
             />
+            <Space size={8} wrap style={{ marginTop: 8 }}>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 0)}>
+                ATM
+              </Button>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 1)}>
+                -1%
+              </Button>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 5)}>
+                -5%
+              </Button>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 10)}>
+                -10%
+              </Button>
+            </Space>
           </div>
 
           <Card size="small" title="Roll Preview" loading={rollPreviewLoading}>
@@ -1435,50 +1582,6 @@ const PutCalendarSpreadRoll: React.FC = () => {
         </Space>
       </Modal>
 
-      <Modal
-        title="Simulation Paused"
-        open={pausePromptOpen}
-        closable={false}
-        maskClosable={false}
-        footer={[
-          <Button key="stop" danger onClick={() => resolvePauseDecision(false)}>
-            Stop
-          </Button>,
-          <Button key="continue" type="primary" onClick={() => resolvePauseDecision(true)}>
-            Continue
-          </Button>,
-        ]}
-      >
-        <Space direction="vertical" size={8} style={{ width: "100%" }}>
-          <Text>Simulation paused for safety. Continue?</Text>
-          <div>
-            <Text strong>Processed Simulations: </Text>
-            <Text>{pauseCheckpointData?.processedCount ?? 0}</Text>
-          </div>
-          <div>
-            <Text strong>Current Date: </Text>
-            <Text>{pauseCheckpointData?.date ?? "-"}</Text>
-          </div>
-          <div>
-            <Text strong>Roll #: </Text>
-            <Text>{pauseCheckpointData?.rollNumber ?? 0}</Text>
-          </div>
-          <div>
-            <Text strong>Closing Price: </Text>
-            <Text>{formatCurrency(pauseCheckpointData?.closingPrice ?? null)}</Text>
-          </div>
-          <div>
-            <Text strong>Cumulative P&L: </Text>
-            <Text
-              style={{
-                color: (pauseCheckpointData?.cumulativePnl ?? 0) >= 0 ? "#3f8600" : "#cf1322",
-              }}
-            >
-              {formatCurrency(pauseCheckpointData?.cumulativePnl ?? null)}
-            </Text>
-          </div>
-        </Space>
-      </Modal>
     </Space>
   );
 };

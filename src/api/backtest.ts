@@ -5,6 +5,7 @@
 
 import type { BacktestRequest, BacktestResponse, PricePoint } from "../types";
 import spyClosingData from "../assets/spy-closing.json";
+import { getSqliteItem } from "../utils/sqliteStorage";
 
 export interface OptionOpenClose {
   openPrice: number | null;
@@ -22,10 +23,21 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 // Massive.com API configuration
 const MASSIVE_API_KEY = "ZMR7fChWbrDYWqvT41rU_rE28HUEkQuS";
 const MASSIVE_BASE_URL = "https://api.massive.com/v1/open-close";
+const MASTER_STOCK_DATA_KEY = "masterStockData";
 const SPY_CLOSING_SERIES: Array<{ date: string; close: number | null }> = spyClosingData;
 const LOCAL_SPY_CLOSING_BY_DATE = new Map(
   SPY_CLOSING_SERIES.map((point) => [point.date, point.close])
 );
+
+interface CachedStockResponse {
+  symbol: string;
+  date: string;
+  openPrice: number | null;
+  closePrice: number | null;
+  statusCode: number | null;
+}
+
+type MasterStockData = Record<string, CachedStockResponse>;
 
 const isJanOrFeb = (date: string): boolean => {
   const month = date.slice(5, 7);
@@ -38,6 +50,34 @@ const getSpyCloseFromJanFebArray = (
 ): number | null | undefined => {
   if (symbol !== "SPY" || !isJanOrFeb(date)) return undefined;
   return LOCAL_SPY_CLOSING_BY_DATE.get(date);
+};
+
+const parseMasterStockData = (raw: string | null): MasterStockData | null => {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as MasterStockData;
+  } catch {
+    return null;
+  }
+};
+
+const loadMasterStockData = async (): Promise<MasterStockData | null> => {
+  if (typeof window !== "undefined") {
+    const fromLocalStorage = parseMasterStockData(window.localStorage.getItem(MASTER_STOCK_DATA_KEY));
+    if (fromLocalStorage) {
+      return fromLocalStorage;
+    }
+  }
+
+  const fromSqlite = parseMasterStockData(await getSqliteItem(MASTER_STOCK_DATA_KEY));
+  return fromSqlite;
 };
 
 /**
@@ -157,6 +197,31 @@ export async function fetchStockOpenClose(
   date: string
 ): Promise<OptionOpenClose> {
   const normalizedSymbol = symbol.trim().toUpperCase();
+  const localMasterStockData = await loadMasterStockData();
+  const stockCacheKey = `${normalizedSymbol}|${date}`;
+  const cachedStock = localMasterStockData?.[stockCacheKey];
+
+  if (cachedStock) {
+    return {
+      openPrice: cachedStock.openPrice ?? null,
+      closePrice: cachedStock.closePrice ?? null,
+      delta: null,
+      theta: null,
+      statusCode: cachedStock.statusCode ?? 200,
+    };
+  }
+
+  const localSpyClose = LOCAL_SPY_CLOSING_BY_DATE.get(date);
+  if (normalizedSymbol === "SPY" && localSpyClose !== undefined) {
+    return {
+      openPrice: null,
+      closePrice: localSpyClose,
+      delta: null,
+      theta: null,
+      statusCode: 200,
+    };
+  }
+
   const spyJanFebClose = getSpyCloseFromJanFebArray(normalizedSymbol, date);
 
   if (normalizedSymbol === "SPY" && isJanOrFeb(date)) {
@@ -169,39 +234,11 @@ export async function fetchStockOpenClose(
     };
   }
 
-  try {
-    const url = `${MASSIVE_BASE_URL}/${normalizedSymbol}/${date}?adjusted=true&apiKey=${MASSIVE_API_KEY}`;
-
-    const res = await fetch(url);
-
-    if (!res.ok) {
-      console.warn(`Failed to fetch stock price for ${normalizedSymbol} on ${date}: ${res.status}`);
-      return {
-        openPrice: null,
-        closePrice: null,
-        delta: null,
-        theta: null,
-        statusCode: res.status,
-      };
-    }
-
-    const data = await res.json();
-
-    return {
-      openPrice: data.open ?? data.o ?? null,
-      closePrice: data.close ?? data.c ?? null,
-      delta: null,
-      theta: null,
-      statusCode: res.status,
-    };
-  } catch (error) {
-    console.error(`Error fetching stock price:`, error);
-    return {
-      openPrice: null,
-      closePrice: null,
-      delta: null,
-      theta: null,
-      statusCode: null,
-    };
-  }
+  return {
+    openPrice: null,
+    closePrice: null,
+    delta: null,
+    theta: null,
+    statusCode: 404,
+  };
 }

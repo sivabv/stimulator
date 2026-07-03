@@ -11,7 +11,6 @@ import {
   Row,
   Space,
   Table,
-  Tag,
   Typography,
   message,
 } from "antd";
@@ -71,6 +70,15 @@ interface RollPreview {
   netCreditDebit: number | null;
 }
 
+interface CallLegModalData {
+  legType: "Short Call" | "Long Call";
+  premium: number | null;
+  expiryDate: string;
+  strike: number;
+  tradeDate: string;
+  status: RowStatus;
+}
+
 interface AutoSavedOptionCheckpoint {
   date: string;
   shortCallPrice: number | null;
@@ -98,6 +106,111 @@ const tradingDates = (tradingDatesJson as string[])
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
 const formatExpiryDate = (dateStr: string): string => dayjs(dateStr).format("YYMMDD");
+const SQRT_TWO_PI = Math.sqrt(2 * Math.PI);
+
+const normalPdf = (x: number): number => Math.exp(-0.5 * x * x) / SQRT_TWO_PI;
+
+const normalCdf = (x: number): number => {
+  const sign = x < 0 ? -1 : 1;
+  const absX = Math.abs(x) / Math.sqrt(2);
+  const t = 1 / (1 + 0.3275911 * absX);
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const erfApprox =
+    1 -
+    (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) *
+      Math.exp(-absX * absX);
+  return 0.5 * (1 + sign * erfApprox);
+};
+
+const blackScholesPrice = (
+  spot: number,
+  strike: number,
+  timeYears: number,
+  sigma: number,
+  optionType: "C" | "P"
+): number => {
+  if (timeYears <= 0 || sigma <= 0 || spot <= 0 || strike <= 0) {
+    return optionType === "C" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+  }
+
+  const sqrtT = Math.sqrt(timeYears);
+  const d1 = (Math.log(spot / strike) + 0.5 * sigma * sigma * timeYears) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+
+  if (optionType === "C") {
+    return spot * normalCdf(d1) - strike * normalCdf(d2);
+  }
+  return strike * normalCdf(-d2) - spot * normalCdf(-d1);
+};
+
+const estimateImpliedVolatility = (
+  marketPrice: number,
+  spot: number,
+  strike: number,
+  timeYears: number,
+  optionType: "C" | "P"
+): number | null => {
+  if (marketPrice <= 0 || spot <= 0 || strike <= 0 || timeYears <= 0) return null;
+
+  const intrinsic = optionType === "C" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+  const target = Math.max(marketPrice, intrinsic + 1e-8);
+
+  let low = 1e-4;
+  let high = 5;
+
+  for (let i = 0; i < 80; i += 1) {
+    const mid = (low + high) / 2;
+    const modelPrice = blackScholesPrice(spot, strike, timeYears, mid, optionType);
+    if (Math.abs(modelPrice - target) < 1e-5) {
+      return mid;
+    }
+    if (modelPrice > target) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+
+  return (low + high) / 2;
+};
+
+const calculateThetaPerDay = (
+  optionPrice: number | null,
+  stockPrice: number | null,
+  strike: number,
+  asOfDate: string,
+  expiryDate: string,
+  optionType: "C" | "P"
+): number | null => {
+  if (
+    optionPrice === null ||
+    stockPrice === null ||
+    !Number.isFinite(optionPrice) ||
+    !Number.isFinite(stockPrice) ||
+    strike <= 0
+  ) {
+    return null;
+  }
+
+  const daysToExpiry = dayjs(expiryDate).diff(dayjs(asOfDate), "day");
+  if (daysToExpiry <= 0) return null;
+
+  const timeYears = daysToExpiry / 365;
+  const impliedVol = estimateImpliedVolatility(optionPrice, stockPrice, strike, timeYears, optionType);
+  if (impliedVol === null) return null;
+
+  const sqrtT = Math.sqrt(timeYears);
+  const d1 = (Math.log(stockPrice / strike) + 0.5 * impliedVol * impliedVol * timeYears) /
+    (impliedVol * sqrtT);
+
+  const thetaPerYear = -(stockPrice * normalPdf(d1) * impliedVol) / (2 * sqrtT);
+  return thetaPerYear / 365;
+};
+
 const buildStrikeCandidates = (baseStrike: number, maxSteps: number): number[] => {
   const candidates: number[] = [roundToNearestFive(baseStrike)];
   for (let step = 1; step <= maxSteps; step += 1) {
@@ -229,9 +342,14 @@ const CallCalendarSpreadRoll: React.FC = () => {
   const [rollStrike, setRollStrike] = useState<number>(0);
   const [rollPreview, setRollPreview] = useState<RollPreview | null>(null);
   const [rollPreviewLoading, setRollPreviewLoading] = useState(false);
+  const [callLegModalOpen, setCallLegModalOpen] = useState(false);
+  const [callLegModalData, setCallLegModalData] = useState<CallLegModalData | null>(null);
   const [autoSavedCheckpoint, setAutoSavedCheckpoint] = useState<AutoSavedOptionCheckpoint | null>(
     loadAutoSavedCheckpoint()
   );
+  const [showSummary, setShowSummary] = useState(true);
+  const [showChart, setShowChart] = useState(true);
+  const [showGrid, setShowGrid] = useState(true);
 
   const [summary, setSummary] = useState<{
     startDate: string;
@@ -325,6 +443,35 @@ const CallCalendarSpreadRoll: React.FC = () => {
     setRollPreview(null);
     setRollModalOpen(true);
     void previewManualRoll(row, defaultRollExpiryDate, row.strike);
+  };
+
+  const openCallLegModal = (row: CallCalendarRow, legType: "Short Call" | "Long Call") => {
+    const premium = legType === "Short Call" ? row.shortCallPrice : row.longCallPrice;
+    const expiryDate = legType === "Short Call" ? row.shortExpiryDate : row.longExpiryDate;
+
+    setCallLegModalData({
+      legType,
+      premium,
+      expiryDate,
+      strike: row.strike,
+      tradeDate: row.date,
+      status: row.status,
+    });
+    setCallLegModalOpen(true);
+  };
+
+  const applyDynamicRollStrike = (row: CallCalendarRow, percentOffset: number) => {
+    if (typeof row.closingPrice !== "number" || !Number.isFinite(row.closingPrice)) {
+      message.warning("No closing price available to calculate strike");
+      return;
+    }
+
+    const computedStrike = roundToNearestFive(row.closingPrice * (1 + percentOffset / 100));
+    setRollStrike(computedStrike);
+
+    if (rollExpiryDate) {
+      void previewManualRoll(row, rollExpiryDate, computedStrike);
+    }
   };
 
   const handleAutoRollOneWeek = async (row: CallCalendarRow) => {
@@ -507,6 +654,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
       let activeStrike = openingStrike;
       let rollNumber = 0;
       let entryNetCredit: number | null = null;
+      let simulationStartShortCallPrice: number | null = null;
       let realisedPnl = 0;
       let autoRollStoppedReason: string | null = null;
 
@@ -559,6 +707,9 @@ const CallCalendarSpreadRoll: React.FC = () => {
         if (entryNetCredit === null) {
           entryNetCredit = currentNetCloseCost;
         }
+        if (simulationStartShortCallPrice === null) {
+          simulationStartShortCallPrice = shortCallPrice;
+        }
 
         const isExpiry = dayjs(date).isSame(dayjs(activeShortExpiryDate), "day");
         const isLastDate = i === dates.length - 1;
@@ -603,6 +754,18 @@ const CallCalendarSpreadRoll: React.FC = () => {
         });
 
         if (autoRollWeeklyEnabled) {
+          const meetsAutoRollDecayCondition =
+            simulationStartShortCallPrice !== null &&
+            shortCallPrice !== null &&
+            shortCallPrice <= simulationStartShortCallPrice * 0.5;
+
+          const daysUntilExpiry = dayjs(activeShortExpiryDate).diff(dayjs(date), "day");
+          const isNearExpiry = daysUntilExpiry >= 0 && daysUntilExpiry < 10;
+
+          if (!meetsAutoRollDecayCondition && !isNearExpiry) {
+            continue;
+          }
+
           const nextTradingDate = getNextTradingDate(date);
           if (!nextTradingDate) {
             autoRollStoppedReason = `Auto roll stopped after ${date}: no next trading date available.`;
@@ -742,12 +905,6 @@ const CallCalendarSpreadRoll: React.FC = () => {
     await runSimulation(updated);
   };
 
-  const statusTag = (status: RowStatus) => {
-    if (status === "rolled") return <Tag color="orange">Rolled</Tag>;
-    if (status === "expired") return <Tag color="red">Expired</Tag>;
-    return <Tag color="green">Active</Tag>;
-  };
-
   const optionPriceChartData = useMemo(
     () =>
       rows.map((row) => ({
@@ -810,6 +967,17 @@ const CallCalendarSpreadRoll: React.FC = () => {
             Auto Roll Weekly: {autoRollWeeklyEnabled ? "ON" : "OFF"}
           </Button>
         </Space>
+        <Space style={{ marginTop: 12 }} wrap>
+          <Button onClick={() => setShowSummary((previous) => !previous)}>
+            {showSummary ? "Hide Summary" : "Show Summary"}
+          </Button>
+          <Button onClick={() => setShowChart((previous) => !previous)}>
+            {showChart ? "Hide Chart" : "Show Chart"}
+          </Button>
+          <Button onClick={() => setShowGrid((previous) => !previous)}>
+            {showGrid ? "Hide Grid" : "Show Grid"}
+          </Button>
+        </Space>
         <Text type="secondary" style={{ display: "block", marginTop: 8 }}>
           Auto-saved checkpoint: {autoSavedCheckpoint?.date ?? "-"} | Short Call {formatCurrency(autoSavedCheckpoint?.shortCallPrice ?? null)} | Long Call {formatCurrency(autoSavedCheckpoint?.longCallPrice ?? null)}
         </Text>
@@ -817,7 +985,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
 
       {error && <Alert type="error" showIcon message="Call Calendar Spread Error" description={error} />}
 
-      {summary && (
+      {summary && showSummary && (
         <Card title="Summary">
           <Row gutter={[24, 8]}>
             <Col xs={24} sm={8}>
@@ -856,52 +1024,55 @@ const CallCalendarSpreadRoll: React.FC = () => {
         </Card>
       )}
 
-      <Card title="Option Price Chart">
-        {optionPriceChartData.length === 0 ? (
-          <Text type="secondary">Run the simulation to view option prices by date.</Text>
-        ) : (
-          <div style={{ width: "100%", height: 320 }}>
-            <ResponsiveContainer>
-              <LineChart data={optionPriceChartData} margin={{ top: 16, right: 16, left: 8, bottom: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="date" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="shortCallPrice"
-                  name="Short Call Price"
-                  stroke="#cf1322"
-                  strokeWidth={2}
-                  dot={false}
-                  connectNulls={false}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="longCallPrice"
-                  name="Long Call Price"
-                  stroke="#0958d9"
-                  strokeWidth={2}
-                  dot={false}
-                  connectNulls={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        )}
-      </Card>
+      {showChart && (
+        <Card title="Option Price Chart">
+          {optionPriceChartData.length === 0 ? (
+            <Text type="secondary">Run the simulation to view option prices by date.</Text>
+          ) : (
+            <div style={{ width: "100%", height: 320 }}>
+              <ResponsiveContainer>
+                <LineChart data={optionPriceChartData} margin={{ top: 16, right: 16, left: 8, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="date" />
+                  <YAxis />
+                  <Tooltip />
+                  <Legend />
+                  <Line
+                    type="monotone"
+                    dataKey="shortCallPrice"
+                    name="Short Call Price"
+                    stroke="#cf1322"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="longCallPrice"
+                    name="Long Call Price"
+                    stroke="#0958d9"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </Card>
+      )}
 
-      <Card title="Records">
-        <Table<CallCalendarRow>
-          rowKey="key"
-          loading={loading}
-          dataSource={rows}
-          pagination={{ pageSize: 50, showSizeChanger: true }}
-          scroll={{ x: "max-content" }}
-          columns={[
+      {showGrid && (
+        <Card title="Records">
+          <Table<CallCalendarRow>
+            rowKey="key"
+            loading={loading}
+            dataSource={rows}
+            pagination={{ pageSize: 50, showSizeChanger: true }}
+            scroll={{ x: "max-content" }}
+            columns={[
             { title: "Roll #", dataIndex: "rollNumber", key: "rollNumber", width: 70 },
-            { title: "Date", dataIndex: "date", key: "date", width: 110 },
+            // { title: "Date", dataIndex: "date", key: "date", width: 110 },
             {
               title: "Closing Price",
               dataIndex: "closingPrice",
@@ -917,84 +1088,172 @@ const CallCalendarSpreadRoll: React.FC = () => {
               render: (v: number) => formatCurrency(v),
             },
             { title: "Short Expiry", dataIndex: "shortExpiryDate", key: "shortExpiryDate", width: 120 },
-            { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
+            // { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
             {
-              title: "Short Call",
-              dataIndex: "shortCallPrice",
-              key: "shortCallPrice",
-              width: 120,
-              render: (v: number | null) => formatCurrency(v),
+              title: "Call Price (Short | Long)",
+              key: "callPriceCombined",
+              width: 260,
+              render: (_: number | null, row: CallCalendarRow) => {
+                const shortCall =
+                  row.shortCallPrice !== null ? (
+                    <Button
+                      type="link"
+                      size="small"
+                      style={{ padding: 0 }}
+                      onClick={() => openCallLegModal(row, "Short Call")}
+                    >
+                      {formatCurrency(row.shortCallPrice)}
+                    </Button>
+                  ) : (
+                    "-"
+                  );
+
+                const longCall =
+                  row.longCallPrice !== null ? (
+                    <Button
+                      type="link"
+                      size="small"
+                      style={{ padding: 0 }}
+                      onClick={() => openCallLegModal(row, "Long Call")}
+                    >
+                      {formatCurrency(row.longCallPrice)}
+                    </Button>
+                  ) : (
+                    "-"
+                  );
+
+                return (
+                  <Space size={4}>
+                    {shortCall}
+                    <Text>|</Text>
+                    {longCall}
+                  </Space>
+                );
+              },
             },
             {
-              title: "Long Call",
-              dataIndex: "longCallPrice",
-              key: "longCallPrice",
-              width: 120,
-              render: (v: number | null) => formatCurrency(v),
+              title: "Theta/Day (Short | Long)",
+              key: "thetaPerDay",
+              width: 320,
+              render: (_: number | null, row: CallCalendarRow) => {
+                const shortTheta = calculateThetaPerDay(
+                  row.shortCallPrice,
+                  row.closingPrice,
+                  row.strike,
+                  row.date,
+                  row.shortExpiryDate,
+                  "C"
+                );
+
+                const longTheta = calculateThetaPerDay(
+                  row.longCallPrice,
+                  row.closingPrice,
+                  row.strike,
+                  row.date,
+                  row.longExpiryDate,
+                  "C"
+                );
+
+                const netTheta =
+                  shortTheta !== null && longTheta !== null
+                    ? longTheta - shortTheta
+                    : null;
+
+                const getColor = (value: number | null) => {
+                  if (value === null || !Number.isFinite(value)) {
+                    return undefined;
+                  }
+                  return value >= 0 ? "#3f8600" : "#cf1322";
+                };
+
+                return (
+                  <Space size={4} wrap>
+                    <Text >{formatCurrency(shortTheta)}</Text>
+                    <Text>|</Text>
+                    <Text >{formatCurrency(longTheta)}</Text>
+                    <Text>(</Text>
+                    <Text style={{ color: getColor(netTheta) }}>
+                      {formatCurrency(netTheta)}
+                    </Text>
+                    <Text>)</Text>
+                  </Space>
+                );
+              },
             },
+            // {
+            //   title: "Entry Net Credit",
+            //   dataIndex: "entryNetCredit",
+            //   key: "entryNetCredit",
+            //   width: 140,
+            //   render: (v: number | null) => formatCurrency(v),
+            // },
+            // {
+            //   title: "Close Net Cost",
+            //   dataIndex: "closeNetCost",
+            //   key: "closeNetCost",
+            //   width: 130,
+            //   render: (v: number | null) => (v !== null ? formatCurrency(v) : "-"),
+            // },
+            // {
+            //   title: "Leg P&L",
+            //   dataIndex: "legPnl",
+            //   key: "legPnl",
+            //   width: 110,
+            //   render: (v: number | null) =>
+            //     v !== null ? (
+            //       <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
+            //     ) : (
+            //       "-"
+            //     ),
+            // },
             {
-              title: "Entry Net Credit",
-              dataIndex: "entryNetCredit",
-              key: "entryNetCredit",
-              width: 140,
-              render: (v: number | null) => formatCurrency(v),
+              title: "Cumulative P&L (Roll Credit/Debit)",
+              key: "cumulativeWithRoll",
+              width: 260,
+              render: (_: number | null, row: CallCalendarRow) => {
+                const cumulative = row.cumulativePnl;
+                const roll = row.rollCreditDebit;
+
+                const cumulativeNode =
+                  cumulative !== null ? (
+                    <Text style={{ color: cumulative >= 0 ? "#3f8600" : "#cf1322" }}>
+                      {formatCurrency(cumulative)}
+                    </Text>
+                  ) : (
+                    "-"
+                  );
+
+                const hasRoll = roll !== null;
+
+                const rollNode = hasRoll ? (
+                  <Text style={{ color: (roll ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                    {formatCurrency(roll)}
+                  </Text>
+                ) : null;
+
+                return (
+                  <Space size={4} wrap>
+                    {cumulativeNode}
+                    {hasRoll ? <Text>(</Text> : null}
+                    {rollNode}
+                    {hasRoll ? <Text>)</Text> : null}
+                  </Space>
+                );
+              },
             },
-            {
-              title: "Close Net Cost",
-              dataIndex: "closeNetCost",
-              key: "closeNetCost",
-              width: 130,
-              render: (v: number | null) => (v !== null ? formatCurrency(v) : "-"),
-            },
-            {
-              title: "Leg P&L",
-              dataIndex: "legPnl",
-              key: "legPnl",
-              width: 110,
-              render: (v: number | null) =>
-                v !== null ? (
-                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
-                ) : (
-                  "-"
-                ),
-            },
-            {
-              title: "Roll Credit/Debit",
-              dataIndex: "rollCreditDebit",
-              key: "rollCreditDebit",
-              width: 140,
-              render: (v: number | null) =>
-                v !== null ? (
-                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
-                ) : (
-                  "-"
-                ),
-            },
-            {
-              title: "Cumulative P&L",
-              dataIndex: "cumulativePnl",
-              key: "cumulativePnl",
-              width: 140,
-              render: (v: number | null) =>
-                v !== null ? (
-                  <Text style={{ color: v >= 0 ? "#3f8600" : "#cf1322" }}>{formatCurrency(v)}</Text>
-                ) : (
-                  "-"
-                ),
-            },
-            {
-              title: "Status",
-              dataIndex: "status",
-              key: "status",
-              width: 100,
-              render: (v: RowStatus) => statusTag(v),
-              filters: [
-                { text: "Active", value: "active" },
-                { text: "Rolled", value: "rolled" },
-                { text: "Expired", value: "expired" },
-              ],
-              onFilter: (value, record) => record.status === value,
-            },
+            // {
+            //   title: "Status",
+            //   dataIndex: "status",
+            //   key: "status",
+            //   width: 100,
+            //   render: (v: RowStatus) => statusTag(v),
+            //   filters: [
+            //     { text: "Active", value: "active" },
+            //     { text: "Rolled", value: "rolled" },
+            //     { text: "Expired", value: "expired" },
+            //   ],
+            //   onFilter: (value, record) => record.status === value,
+            // },
             {
               title: "Action",
               key: "action",
@@ -1004,15 +1263,16 @@ const CallCalendarSpreadRoll: React.FC = () => {
                   <Button size="small" onClick={() => openRollModal(row)} disabled={loading}>
                     Roll
                   </Button>
-                  <Button size="small" onClick={() => void handleAutoRollOneWeek(row)} disabled>
+                  <Button size="small" onClick={() => void handleAutoRollOneWeek(row)} disabled={loading}>
                     Auto Roll 1W
                   </Button>
                 </Space>
               ),
             },
-          ]}
-        />
-      </Card>
+            ]}
+          />
+        </Card>
+      )}
 
       <Modal
         title="Roll Short Call"
@@ -1055,6 +1315,20 @@ const CallCalendarSpreadRoll: React.FC = () => {
               style={{ width: "100%", marginTop: 8 }}
               step={5}
             />
+            <Space size={8} wrap style={{ marginTop: 8 }}>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 0)}>
+                ATM
+              </Button>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 1)}>
+                +1%
+              </Button>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 5)}>
+                +5%
+              </Button>
+              <Button size="small" onClick={() => rollTargetRow && applyDynamicRollStrike(rollTargetRow, 10)}>
+                +10%
+              </Button>
+            </Space>
           </div>
 
           <Card size="small" title="Roll Preview" loading={rollPreviewLoading}>
@@ -1080,6 +1354,45 @@ const CallCalendarSpreadRoll: React.FC = () => {
             </Row>
           </Card>
         </Space>
+      </Modal>
+
+      <Modal
+        title={callLegModalData ? `${callLegModalData.legType} Details` : "Call Leg Details"}
+        open={callLegModalOpen}
+        footer={null}
+        onCancel={() => {
+          setCallLegModalOpen(false);
+          setCallLegModalData(null);
+        }}
+      >
+        {callLegModalData ? (
+          <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <div>
+              <Text strong>Trade Date: </Text>
+              <Text>{callLegModalData.tradeDate}</Text>
+            </div>
+            <div>
+              <Text strong>Leg Type: </Text>
+              <Text>{callLegModalData.legType}</Text>
+            </div>
+            <div>
+              <Text strong>Premium: </Text>
+              <Text>{formatCurrency(callLegModalData.premium)}</Text>
+            </div>
+            <div>
+              <Text strong>Expiry Date: </Text>
+              <Text>{callLegModalData.expiryDate}</Text>
+            </div>
+            <div>
+              <Text strong>Strike: </Text>
+              <Text>{formatCurrency(callLegModalData.strike)}</Text>
+            </div>
+            <div>
+              <Text strong>Status: </Text>
+              <Text>{callLegModalData.status}</Text>
+            </div>
+          </Space>
+        ) : null}
       </Modal>
     </Space>
   );

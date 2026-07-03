@@ -924,19 +924,21 @@ const CallCalendar: React.FC = () => {
     //   },
     // },
     {
-      title: "Call Price",
-      dataIndex: "cePremiumData",
-      key: "cePrice",
-      width: 200,
-      render: (value: StrikePremium | null, _record: OptionsAnalysisRowV2, index: number) => {
-        if (!value) return "—";
+      title: "Call Price (Short | Long)",
+      key: "cePriceCombined",
+      width: 260,
+      render: (_value: unknown, record: OptionsAnalysisRowV2, index: number) => {
+        const shortValue = record.cePremiumData;
+        const longValue = record.longCePremiumData;
+
+        if (!shortValue && !longValue) return "—";
 
         let percentageChange: number | null = null;
-        if (result && result.rows.length > 0 && index !== 0) {
+        if (shortValue && result && result.rows.length > 0 && index !== 0) {
           const firstRow = result.rows[0];
           const firstCallPrice = firstRow.cePremiumData?.closePrice ?? null;
           if (firstCallPrice !== null && firstCallPrice !== 0) {
-            percentageChange = ((value.closePrice - firstCallPrice) / firstCallPrice) * 100;
+            percentageChange = ((shortValue.closePrice - firstCallPrice) / firstCallPrice) * 100;
           }
         }
 
@@ -947,12 +949,10 @@ const CallCalendar: React.FC = () => {
         const percentageColor =
           percentageChange !== null ? (percentageChange >= 0 ? "#52c41a" : "#ff4d4f") : "inherit";
 
-        return (
-          <div style={{ color: percentageColor }}>
-            {value.closePrice.toFixed(2)}
-            {percentageDisplay}
-          </div>
-        );
+        const shortText = shortValue ? `${shortValue.closePrice.toFixed(2)}${percentageDisplay}` : "-";
+        const longText = longValue ? longValue.closePrice.toFixed(2) : "-";
+
+        return <div style={{ color: percentageColor }}>{shortText} | {longText}</div>;
       },
     },
     // {
@@ -965,16 +965,6 @@ const CallCalendar: React.FC = () => {
     //     return value.toFixed(2);
     //   },
     // },
-    {
-      title: "Long Call Price",
-      dataIndex: "longCePremiumData",
-      key: "longCePrice",
-      width: 140,
-      render: (value: StrikePremium | null) => {
-        if (!value) return "—";
-        return value.closePrice.toFixed(2);
-      },
-    },
     {
       title: "Net Value",
       key: "netValue",

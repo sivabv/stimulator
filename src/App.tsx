@@ -26,6 +26,7 @@ const WeeklyStraddleRoll = lazy(() => import("./components/WeeklyStraddleRoll"))
 const StraddleRolling = lazy(() => import("./components/StraddleRolling"));
 const PutCalendarSpreadRoll = lazy(() => import("./components/PutCalendarSpreadRoll"));
 const CallCalendarSpreadRoll = lazy(() => import("./components/CallCalendarSpreadRoll"));
+const CalendarSpreadRollSplit = lazy(() => import("./components/CalendarSpreadRollSplit"));
 const LocalFullScreenCharts = lazy(() => import("./components/LocalFullScreenCharts"));
 const ChartsAndLink = lazy(() => import("./components/ChartsAndLink"));
 
@@ -332,6 +333,15 @@ const App: React.FC = () => {
                 children: (
                   <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
                     <CallCalendarSpreadRoll />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "calendar-spread-roll-split",
+                label: "Call + Put Split",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <CalendarSpreadRollSplit />
                   </Suspense>
                 ),
               },
