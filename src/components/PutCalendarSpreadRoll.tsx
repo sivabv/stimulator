@@ -1235,7 +1235,20 @@ const PutCalendarSpreadRoll: React.FC = () => {
             //   width: 100,
             //   render: (v: number) => formatCurrency(v),
             // },
-            { title: "Short Expiry", dataIndex: "shortExpiryDate", key: "shortExpiryDate", width: 120 },
+            {
+              title: "Closing Price | Short Expiry | Strike",
+              key: "closeExpiryStrike",
+              width: 360,
+              render: (_: number | null, row: PutCalendarRow) => (
+                <Space size={4}>
+                  <Text>{formatCurrency(row.closingPrice)}</Text>
+                  <Text>|</Text>
+                  <Text>{row.shortExpiryDate || "-"}</Text>
+                  <Text>|</Text>
+                  <Text>{formatCurrency(row.strike)}</Text>
+                </Space>
+              ),
+            },
             // { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
             {
               title: "Put Price (Short | Long)",

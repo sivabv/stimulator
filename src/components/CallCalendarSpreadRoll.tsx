@@ -1074,20 +1074,19 @@ const CallCalendarSpreadRoll: React.FC = () => {
             { title: "Roll #", dataIndex: "rollNumber", key: "rollNumber", width: 70 },
             // { title: "Date", dataIndex: "date", key: "date", width: 110 },
             {
-              title: "Closing Price",
-              dataIndex: "closingPrice",
-              key: "closingPrice",
-              width: 130,
-              render: (v: number | null) => formatCurrency(v),
+              title: "Closing Price | Short Expiry | Strike",
+              key: "closeExpiryStrike",
+              width: 360,
+              render: (_: number | null, row: CallCalendarRow) => (
+                <Space size={4}>
+                  <Text>{formatCurrency(row.closingPrice)}</Text>
+                  <Text>|</Text>
+                  <Text>{row.shortExpiryDate || "-"}</Text>
+                  <Text>|</Text>
+                  <Text>{formatCurrency(row.strike)}</Text>
+                </Space>
+              ),
             },
-            {
-              title: "Strike",
-              dataIndex: "strike",
-              key: "strike",
-              width: 100,
-              render: (v: number) => formatCurrency(v),
-            },
-            { title: "Short Expiry", dataIndex: "shortExpiryDate", key: "shortExpiryDate", width: 120 },
             // { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
             {
               title: "Call Price (Short | Long)",

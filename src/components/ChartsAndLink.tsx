@@ -31,6 +31,7 @@ interface WeeklyOptionCloseRow {
   key: string;
   date: string;
   closePrice: number | null;
+  thetaPerDay?: number | null;
 }
 
 interface SavedWeeklyCloseRecord {
@@ -109,8 +110,121 @@ const FIXED_DEFAULT_CURRENT_DATE = dayjs("2025-01-02");
 const FIXED_DEFAULT_EXPIRY_DATE = dayjs("2025-12-19");
 const formatExpiryDate = (dateValue: Dayjs) => dateValue.format("YYMMDD");
 const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
+const SQRT_TWO_PI = Math.sqrt(2 * Math.PI);
 const toChartValue = (value: number | null | undefined): number | null =>
   typeof value === "number" && Number.isFinite(value) && value !== 0 ? value : null;
+const normalPdf = (x: number): number => Math.exp(-0.5 * x * x) / SQRT_TWO_PI;
+
+const normalCdf = (x: number): number => {
+  const sign = x < 0 ? -1 : 1;
+  const absX = Math.abs(x) / Math.sqrt(2);
+  const t = 1 / (1 + 0.3275911 * absX);
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const erfApprox =
+    1 -
+    (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) *
+      Math.exp(-absX * absX);
+  return 0.5 * (1 + sign * erfApprox);
+};
+
+const blackScholesPrice = (
+  spot: number,
+  strike: number,
+  timeYears: number,
+  sigma: number,
+  optionType: OptionType
+): number => {
+  if (timeYears <= 0 || sigma <= 0 || spot <= 0 || strike <= 0) {
+    return optionType === "Call" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+  }
+
+  const sqrtT = Math.sqrt(timeYears);
+  const d1 = (Math.log(spot / strike) + 0.5 * sigma * sigma * timeYears) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+
+  if (optionType === "Call") {
+    return spot * normalCdf(d1) - strike * normalCdf(d2);
+  }
+
+  return strike * normalCdf(-d2) - spot * normalCdf(-d1);
+};
+
+const estimateImpliedVolatility = (
+  marketPrice: number,
+  spot: number,
+  strike: number,
+  timeYears: number,
+  optionType: OptionType
+): number | null => {
+  if (marketPrice <= 0 || spot <= 0 || strike <= 0 || timeYears <= 0) {
+    return null;
+  }
+
+  const intrinsic =
+    optionType === "Call" ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+  const targetPrice = Math.max(marketPrice, intrinsic + 1e-8);
+
+  let low = 1e-4;
+  let high = 5;
+
+  for (let i = 0; i < 80; i += 1) {
+    const mid = (low + high) / 2;
+    const modelPrice = blackScholesPrice(spot, strike, timeYears, mid, optionType);
+
+    if (Math.abs(modelPrice - targetPrice) < 1e-5) {
+      return mid;
+    }
+
+    if (modelPrice > targetPrice) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+
+  return (low + high) / 2;
+};
+
+const calculateThetaPerDay = (
+  optionPrice: number | null,
+  stockPrice: number | null,
+  strike: number,
+  asOfDate: string,
+  expiryDate: string,
+  optionType: OptionType
+): number | null => {
+  if (
+    optionPrice === null ||
+    stockPrice === null ||
+    !Number.isFinite(optionPrice) ||
+    !Number.isFinite(stockPrice) ||
+    strike <= 0
+  ) {
+    return null;
+  }
+
+  const daysToExpiry = dayjs(expiryDate).diff(dayjs(asOfDate), "day");
+  if (daysToExpiry <= 0) {
+    return null;
+  }
+
+  const timeYears = daysToExpiry / 365;
+  const impliedVol = estimateImpliedVolatility(optionPrice, stockPrice, strike, timeYears, optionType);
+  if (impliedVol === null) {
+    return null;
+  }
+
+  const sqrtT = Math.sqrt(timeYears);
+  const d1 = (Math.log(stockPrice / strike) + 0.5 * impliedVol * impliedVol * timeYears) /
+    (impliedVol * sqrtT);
+  const thetaPerYear = -(stockPrice * normalPdf(d1) * impliedVol) / (2 * sqrtT);
+
+  return thetaPerYear / 365;
+};
 const getRollDateFromExpiry = (expiryDateIso: string): Dayjs | null => {
   const expiry = dayjs(expiryDateIso);
   if (!expiry.isValid()) {
@@ -202,6 +316,39 @@ const ChartsAndLink: React.FC = () => {
     netTradeResult: null,
   });
   const [rollOptionValueLoading, setRollOptionValueLoading] = useState(false);
+  const stockCloseBySymbolDateRef = React.useRef<Record<string, number | null>>({});
+  const stockCloseInFlightRef = React.useRef<Map<string, Promise<number | null>>>(new Map());
+
+  const fetchStockCloseCached = async (symbol: string, quoteDate: string): Promise<number | null> => {
+    const cacheKey = `${symbol}|${quoteDate}`;
+    const cachedClose = stockCloseBySymbolDateRef.current[cacheKey];
+    if (cachedClose !== undefined) {
+      return cachedClose;
+    }
+
+    const pending = stockCloseInFlightRef.current.get(cacheKey);
+    if (pending) {
+      return pending;
+    }
+
+    const request = (async () => {
+      const response = await fetchStockOpenClose(symbol, quoteDate);
+      const closePrice =
+        typeof response.closePrice === "number" && Number.isFinite(response.closePrice)
+          ? response.closePrice
+          : null;
+      stockCloseBySymbolDateRef.current[cacheKey] = closePrice;
+      return closePrice;
+    })();
+
+    stockCloseInFlightRef.current.set(cacheKey, request);
+
+    try {
+      return await request;
+    } finally {
+      stockCloseInFlightRef.current.delete(cacheKey);
+    }
+  };
 
   const extractStrikeFromOptionName = (optionName: string): number | null => {
     const strikeMatch = optionName.match(/\b(\d+(?:\.\d+)?)\b/);
@@ -323,8 +470,86 @@ const ChartsAndLink: React.FC = () => {
         key: row.date,
         date: row.date,
         closePrice: typeof row.closePrice === "number" && Number.isFinite(row.closePrice) ? row.closePrice : null,
+        thetaPerDay:
+          typeof row.thetaPerDay === "number" && Number.isFinite(row.thetaPerDay)
+            ? row.thetaPerDay
+            : null,
       }));
   };
+
+  React.useEffect(() => {
+    if (!weeklyRecordsHydrated || savedWeeklyCloseRecords.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const backfillMissingTheta = async () => {
+      const hasMissingTheta = savedWeeklyCloseRecords.some((record) =>
+        record.rows.some(
+          (row) =>
+            row.closePrice !== null &&
+            (row.thetaPerDay === null || row.thetaPerDay === undefined)
+        )
+      );
+
+      if (!hasMissingTheta) {
+        return;
+      }
+
+      const nextRecords: SavedWeeklyCloseRecord[] = [];
+
+      for (const record of savedWeeklyCloseRecords) {
+        const nextRows: WeeklyOptionCloseRow[] = [];
+
+        for (const row of record.rows) {
+          if (row.closePrice === null || (row.thetaPerDay !== null && row.thetaPerDay !== undefined)) {
+            nextRows.push(row);
+            continue;
+          }
+
+          const stockClose = await fetchStockCloseCached(record.symbol, row.date);
+          const thetaPerDay = calculateThetaPerDay(
+            row.closePrice,
+            stockClose,
+            record.strike,
+            row.date,
+            record.expiryDate,
+            record.optionType
+          );
+
+          nextRows.push({
+            ...row,
+            thetaPerDay,
+          });
+        }
+
+        nextRecords.push({
+          ...record,
+          rows: nextRows,
+        });
+      }
+
+      if (cancelled) {
+        return;
+      }
+
+      setSavedWeeklyCloseRecords(nextRecords);
+
+      if (activeWeeklyRecordId) {
+        const activeRecord = nextRecords.find((record) => record.id === activeWeeklyRecordId);
+        if (activeRecord) {
+          setWeeklyCloseRows(activeRecord.rows);
+        }
+      }
+    };
+
+    void backfillMissingTheta();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWeeklyRecordId, savedWeeklyCloseRecords, weeklyRecordsHydrated]);
 
   React.useEffect(() => {
     const rawDates = localStorage.getItem(CHARTS_LINK_DATES_STORAGE_KEY);
@@ -531,10 +756,21 @@ const ChartsAndLink: React.FC = () => {
               quoteDate
             );
 
+            const stockClose = await fetchStockCloseCached(seed.symbol, quoteDate);
+            const thetaPerDay = calculateThetaPerDay(
+              response.closePrice,
+              stockClose,
+              seed.strike,
+              quoteDate,
+              seed.expiryDate,
+              seed.optionType
+            );
+
             rows.push({
               key: quoteDate,
               date: quoteDate,
               closePrice: response.closePrice,
+              thetaPerDay,
             });
           }
 
@@ -801,10 +1037,21 @@ const ChartsAndLink: React.FC = () => {
           quoteDate
         );
 
+        const stockClose = await fetchStockCloseCached(selectedRequest.symbol, quoteDate);
+        const thetaPerDay = calculateThetaPerDay(
+          response.closePrice,
+          stockClose,
+          selectedRequest.strike,
+          quoteDate,
+          selectedRequest.expiry.format("YYYY-MM-DD"),
+          selectedRequest.optionSide === "C" ? "Call" : "Put"
+        );
+
         rows.push({
           key: quoteDate,
           date: quoteDate,
           closePrice: response.closePrice,
+          thetaPerDay,
         });
       }
 
@@ -869,6 +1116,17 @@ const ChartsAndLink: React.FC = () => {
       record.rows.forEach((row) => {
         const existing = dateMap.get(row.date) ?? { date: row.date };
         existing[seriesKey] = toChartValue(row.closePrice);
+        const currentTheta = existing.combinedTheta;
+        const thetaSeed =
+          typeof currentTheta === "number" && Number.isFinite(currentTheta)
+            ? currentTheta
+            : 0;
+        const rowTheta =
+          typeof row.thetaPerDay === "number" && Number.isFinite(row.thetaPerDay)
+            ? row.thetaPerDay
+            : 0;
+        const nextTheta = thetaSeed + rowTheta;
+        existing.combinedTheta = Number.isFinite(nextTheta) ? Number(nextTheta.toFixed(6)) : null;
         dateMap.set(row.date, existing);
       });
     });
@@ -925,6 +1183,7 @@ const ChartsAndLink: React.FC = () => {
       record.rows.forEach((row) => {
         const existing = rowMap.get(row.date) ?? { key: row.date, date: row.date };
         existing[datasetKey] = row.closePrice;
+        existing[`${datasetKey}_theta`] = row.thetaPerDay ?? null;
         rowMap.set(row.date, existing);
       });
     });
@@ -969,6 +1228,12 @@ const ChartsAndLink: React.FC = () => {
               return "-";
             }
 
+            const thetaRaw = row[`${meta.key}_theta`];
+            const theta =
+              typeof thetaRaw === "number" && Number.isFinite(thetaRaw)
+                ? thetaRaw
+                : null;
+
             return (
               <Button
                 type="link"
@@ -989,7 +1254,7 @@ const ChartsAndLink: React.FC = () => {
                   });
                 }}
               >
-                {value.toFixed(2)}
+                {`${value.toFixed(2)}${theta !== null ? ` (${theta.toFixed(4)})` : ""}`}
               </Button>
             );
           },
@@ -1033,6 +1298,7 @@ const ChartsAndLink: React.FC = () => {
 
     const chartSeries = [
       ...pairedSeries.map((seriesItem) => ({ key: seriesItem.key, name: seriesItem.name })),
+      { key: "combinedTheta", name: "Combined Theta/Day" },
     ];
 
     const data = pivotTableState.rows
@@ -1045,6 +1311,18 @@ const ChartsAndLink: React.FC = () => {
         const dataPoint: Record<string, string | number | null> = {
           date: row.date,
         };
+
+        const combinedTheta = pivotTableState.seriesMeta.reduce((sum, _meta, seriesIndex) => {
+          const thetaRaw = row[`dataset_${seriesIndex + 1}_theta`];
+          const thetaValue =
+            typeof thetaRaw === "number" && Number.isFinite(thetaRaw)
+              ? thetaRaw
+              : 0;
+          return sum + thetaValue;
+        }, 0);
+        dataPoint.combinedTheta = Number.isFinite(combinedTheta)
+          ? Number(combinedTheta.toFixed(6))
+          : null;
 
         pairedSeries.forEach((seriesItem) => {
           const leftValue = Number(row[seriesItem.leftKey]);
@@ -1145,6 +1423,12 @@ const ChartsAndLink: React.FC = () => {
             return "-";
           }
 
+          const thetaRaw = currentRow[`dataset_${index + 1}_theta`];
+          const theta =
+            typeof thetaRaw === "number" && Number.isFinite(thetaRaw)
+              ? thetaRaw
+              : null;
+
           return (
             <Button
               type="link"
@@ -1165,7 +1449,7 @@ const ChartsAndLink: React.FC = () => {
                 });
               }}
             >
-              {value.toFixed(2)}
+              {`${value.toFixed(2)}${theta !== null ? ` (${theta.toFixed(4)})` : ""}`}
             </Button>
           );
         },
@@ -1175,6 +1459,7 @@ const ChartsAndLink: React.FC = () => {
     recordsWithData.forEach((record, index) => {
       const matchingRow = record.rows.find((entry) => entry.date === selectedDateIso);
       row[`dataset_${index + 1}`] = matchingRow?.closePrice ?? null;
+      row[`dataset_${index + 1}_theta`] = matchingRow?.thetaPerDay ?? null;
     });
 
     row.result = resultValueForRow(row);
@@ -1422,10 +1707,22 @@ const ChartsAndLink: React.FC = () => {
                   tick={{ fontSize: 11 }}
                   tickFormatter={(v: number) => `$${v.toFixed(0)}`}
                 />
+                <YAxis
+                  yAxisId="theta"
+                  orientation="right"
+                  tick={{ fontSize: 11 }}
+                  tickFormatter={(v: number) => v.toFixed(3)}
+                />
                 <Tooltip
-                  formatter={(v) => {
+                  formatter={(v, name) => {
                     const numericValue = typeof v === "number" ? v : Number(v);
                     const safeValue = toChartValue(Number.isFinite(numericValue) ? numericValue : null);
+                    if (name === "Combined Theta/Day") {
+                      return [
+                        Number.isFinite(numericValue) ? numericValue.toFixed(4) : "-",
+                        "Combined Theta/Day",
+                      ];
+                    }
                     return [safeValue !== null ? `$${safeValue.toFixed(2)}` : "-", "Close"];
                   }}
                 />
@@ -1442,6 +1739,17 @@ const ChartsAndLink: React.FC = () => {
                     strokeWidth={series.id === activeWeeklyRecordId ? 3 : 2}
                   />
                 ))}
+                <Line
+                  type="monotone"
+                  dataKey="combinedTheta"
+                  name="Combined Theta/Day"
+                  yAxisId="theta"
+                  stroke="#111111"
+                  strokeDasharray="6 4"
+                  dot={false}
+                  connectNulls
+                  strokeWidth={2}
+                />
               </LineChart>
             </ResponsiveContainer>
           )
@@ -1498,6 +1806,12 @@ const ChartsAndLink: React.FC = () => {
                   domain={["auto", "auto"]}
                   tick={{ fontSize: 11 }}
                   tickFormatter={(v: number) => v.toFixed(2)}
+                />
+                <YAxis
+                  yAxisId="theta"
+                  orientation="right"
+                  tick={{ fontSize: 11 }}
+                  tickFormatter={(v: number) => v.toFixed(3)}
                 />
                 <Tooltip
                   content={({ active, payload, label }) => {
@@ -1609,10 +1923,12 @@ const ChartsAndLink: React.FC = () => {
                     type="monotone"
                     dataKey={series.key}
                     name={series.name}
+                    yAxisId={series.key === "combinedTheta" ? "theta" : undefined}
                     stroke={OPTION_SERIES_COLORS[index % OPTION_SERIES_COLORS.length]}
                     dot={false}
                     strokeWidth={series.key === "result" ? 3 : 2}
                     connectNulls
+                    strokeDasharray={series.key === "combinedTheta" ? "6 4" : undefined}
                   />
                 ))}
               </LineChart>
