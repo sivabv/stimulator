@@ -175,14 +175,6 @@ const formatCurrency = (value: number | null) => {
 	}).format(value);
 };
 
-const formatPercent = (value: number | null) => {
-	if (value === null || !Number.isFinite(value)) {
-		return "-";
-	}
-
-	return `${value.toFixed(2)}%`;
-};
-
 const InterestCalculator: React.FC = () => {
 	const [symbol, setSymbol] = useState("SPY");
 	const [startDate, setStartDate] = useState("2025-06-20");
