@@ -349,7 +349,7 @@ const PRELOADED_WEEKLY_RECORDS: SavedWeeklyCloseRecord[] = DEFAULT_WEEKLY_RECORD
   rows: [],
 }));
 
-const ChartsAndLink: React.FC = () => {
+const ChartsAndLinkV2: React.FC = () => {
   type LegendEntryLike = { dataKey?: string | number | ((obj: unknown) => unknown) };
 
   const [selectedSymbol, setSelectedSymbol] = useState("SPY");
@@ -2159,7 +2159,7 @@ const ChartsAndLink: React.FC = () => {
       <Row gutter={[16, 16]} align="middle">
         <Col>
           <Title level={4} style={{ margin: 0 }}>
-            Charts &amp; Links
+            Charts &amp; Links V2
           </Title>
         </Col>
       </Row>
@@ -2677,4 +2677,4 @@ const ChartsAndLink: React.FC = () => {
   );
 };
 
-export default ChartsAndLink;
+export default ChartsAndLinkV2;

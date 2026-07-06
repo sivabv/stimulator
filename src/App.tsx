@@ -29,6 +29,7 @@ const CallCalendarSpreadRoll = lazy(() => import("./components/CallCalendarSprea
 const CalendarSpreadRollSplit = lazy(() => import("./components/CalendarSpreadRollSplit"));
 const LocalFullScreenCharts = lazy(() => import("./components/LocalFullScreenCharts"));
 const ChartsAndLink = lazy(() => import("./components/ChartsAndLink"));
+const ChartsAndLinkV2 = lazy(() => import("./components/ChartsAndLinkV2"));
 
 const App: React.FC = () => {
   // Backtest state
@@ -254,6 +255,15 @@ const App: React.FC = () => {
                 ),
               },
               {
+                key: "charts-and-link-v2",
+                label: "Charts & Links V2",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <ChartsAndLinkV2 />
+                  </Suspense>
+                ),
+              },
+              {
                 key: "options-analyzer",
                 label: "Options Analyzer",
                 children: (
@@ -363,7 +373,8 @@ const App: React.FC = () => {
                   </Suspense>
                 ),
               },
-            
+
+
             ]}
           />
         </Content>

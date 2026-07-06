@@ -8,6 +8,7 @@ import {
   Input,
   InputNumber,
   Modal,
+  Popover,
   Row,
   Space,
   Table,
@@ -28,6 +29,7 @@ import {
 } from "recharts";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDatesJson from "../assets/trading_dates_2026.json";
+import spyClosingData from "../assets/spy-closing.json";
 
 const { Text } = Typography;
 
@@ -104,12 +106,23 @@ const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
 const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
 const LONG_EXPIRY_MIN_DTE_DAYS = 150;
 const LONG_EXPIRY_MAX_DTE_DAYS = 400;
-const MIN_AUTO_ROLL_CREDIT = 1.25;
+const MIN_AUTO_ROLL_CREDIT = 0.2;
+const AUTO_ROLL_POPUP_MIN_NET_CREDIT_DEBIT = -10;
+const AUTO_ROLL_POPUP_MAX_NET_CREDIT_DEBIT = 10;
+const AUTO_ROLL_POPUP_WINDOW_WEEKS = 6;
 const AUTO_ROLL_MAX_STRIKE_STEPS = 8;
+const MAX_SIMULATION_TRADING_DAYS = 50;
 
-const tradingDates = (tradingDatesJson as string[])
-  .filter((value) => dayjs(value).isValid())
-  .sort((a, b) => dayjs(a).valueOf() - dayjs(b).valueOf());
+const fullTradingDatesFromSpy = (spyClosingData as Array<{ date?: string }>)
+  .map((entry) => (typeof entry.date === "string" ? entry.date : null))
+  .filter((value): value is string => Boolean(value) && dayjs(value).isValid());
+
+const fallbackTradingDates = (tradingDatesJson as string[])
+  .filter((value) => dayjs(value).isValid());
+
+const tradingDates = Array.from(
+  new Set(fullTradingDatesFromSpy.length > 0 ? fullTradingDatesFromSpy : fallbackTradingDates)
+).sort((a, b) => dayjs(a).valueOf() - dayjs(b).valueOf());
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
@@ -229,6 +242,27 @@ const buildStrikeCandidates = (baseStrike: number, maxSteps: number): number[] =
   return [...new Set(candidates)].filter((strike) => strike > 0);
 };
 
+const buildNearMoneyStrikeCandidates = (closingPrice: number): number[] => {
+  const lower = roundToNearestFive(closingPrice * 0.95);
+  const upper = roundToNearestFive(closingPrice * 1.05);
+  const minStrike = Math.min(lower, upper);
+  const maxStrike = Math.max(lower, upper);
+
+  const candidates: number[] = [];
+  for (let strike = minStrike; strike <= maxStrike; strike += 5) {
+    if (strike > 0) {
+      candidates.push(strike);
+    }
+  }
+
+  const atmStrike = roundToNearestFive(closingPrice);
+  if (atmStrike > 0) {
+    candidates.push(atmStrike);
+  }
+
+  return [...new Set(candidates)].sort((a, b) => a - b);
+};
+
 const formatCurrency = (value: number | null) => {
   if (value === null || !Number.isFinite(value)) return "-";
   return new Intl.NumberFormat("en-US", {
@@ -241,34 +275,6 @@ const formatCurrency = (value: number | null) => {
 const formatPercent = (value: number | null) => {
   if (value === null || !Number.isFinite(value)) return "-";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
-};
-
-const areRowsEqual = (left: CallCalendarRow, right: CallCalendarRow): boolean => {
-  return (
-    left.key === right.key &&
-    left.date === right.date &&
-    left.closingPrice === right.closingPrice &&
-    left.strike === right.strike &&
-    left.shortExpiryDate === right.shortExpiryDate &&
-    left.longExpiryDate === right.longExpiryDate &&
-    left.shortCallPrice === right.shortCallPrice &&
-    left.longCallPrice === right.longCallPrice &&
-    left.entryNetCredit === right.entryNetCredit &&
-    left.rollCreditDebit === right.rollCreditDebit &&
-    left.closeNetCost === right.closeNetCost &&
-    left.legPnl === right.legPnl &&
-    left.cumulativePnl === right.cumulativePnl &&
-    left.status === right.status &&
-    left.rollNumber === right.rollNumber
-  );
-};
-
-const mergeRows = (previousRows: CallCalendarRow[], nextRows: CallCalendarRow[]): CallCalendarRow[] => {
-  const previousByKey = new Map(previousRows.map((row) => [row.key, row]));
-  return nextRows.map((row) => {
-    const previous = previousByKey.get(row.key);
-    return previous && areRowsEqual(previous, row) ? previous : row;
-  });
 };
 
 const getFirstTradingDateOnOrAfter = (date: string): string | null =>
@@ -334,10 +340,10 @@ const saveAutoSavedCheckpoint = (checkpoint: AutoSavedOptionCheckpoint) => {
 };
 
 const CallCalendarSpreadRoll: React.FC = () => {
-  const [startDate, setStartDate] = useState("2025-01-02");
-  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("2025-06-30");
-  const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("2025-12-19");
-  const [stockTicker, setStockTicker] = useState("SPY");
+  const [startDate, setStartDate] = useState("2026-01-02");
+  const [preferredShortExpiryDate, setPreferredShortExpiryDate] = useState("2026-01-30");
+  const [preferredLongExpiryDate, setPreferredLongExpiryDate] = useState("2026-12-18");
+  const [stockTicker, setStockTicker] = useState("MSFT");
   const [autoRollWeeklyEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -354,6 +360,10 @@ const CallCalendarSpreadRoll: React.FC = () => {
   const [callLegModalData, setCallLegModalData] = useState<CallLegModalData | null>(null);
   const [rollingOptionsLoading, setRollingOptionsLoading] = useState(false);
   const [rollingOptions, setRollingOptions] = useState<RollingOptionCandidate[]>([]);
+  const [autoRollPopoverRowKey, setAutoRollPopoverRowKey] = useState<string | null>(null);
+  const [autoRollTargetRow, setAutoRollTargetRow] = useState<CallCalendarRow | null>(null);
+  const [autoRollCandidatesLoading, setAutoRollCandidatesLoading] = useState(false);
+  const [autoRollCandidates, setAutoRollCandidates] = useState<RollingOptionCandidate[]>([]);
   const [autoSavedCheckpoint, setAutoSavedCheckpoint] = useState<AutoSavedOptionCheckpoint | null>(
     loadAutoSavedCheckpoint()
   );
@@ -480,7 +490,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
 
     setRollingOptionsLoading(true);
     try {
-      const targetFromDate = dayjs(row.shortExpiryDate).add(7, "day").format("YYYY-MM-DD");
+      const targetFromDate = getNextTradingDate(row.date) ?? dayjs(row.date).add(1, "day").format("YYYY-MM-DD");
       const candidateExpiries = tradingDates
         .filter((value) =>
           dayjs(value).isSame(dayjs(targetFromDate), "day") || dayjs(value).isAfter(dayjs(targetFromDate), "day")
@@ -542,73 +552,120 @@ const CallCalendarSpreadRoll: React.FC = () => {
     }
   };
 
+  const closeAutoRollPopover = () => {
+    setAutoRollPopoverRowKey(null);
+    setAutoRollCandidates([]);
+    setAutoRollCandidatesLoading(false);
+  };
+
   const handleAutoRollOneWeek = async (row: CallCalendarRow) => {
-    const nextTradingDate = getNextTradingDate(row.date);
+    setAutoRollTargetRow(row);
+    setAutoRollCandidates([]);
+    setAutoRollPopoverRowKey(row.key);
+
+    if (row.shortCallPrice === null || row.closingPrice === null) {
+      return;
+    }
+
+    setAutoRollCandidatesLoading(true);
+    try {
+      const targetFromDate = row.date;
+      const targetEndDate = dayjs(targetFromDate).add(AUTO_ROLL_POPUP_WINDOW_WEEKS, "week").format("YYYY-MM-DD");
+      const candidateExpiries = tradingDates.filter((value) => {
+        const day = dayjs(value);
+        return (
+          (day.isSame(dayjs(targetFromDate), "day") || day.isAfter(dayjs(targetFromDate), "day")) &&
+          (day.isSame(dayjs(targetEndDate), "day") || day.isBefore(dayjs(targetEndDate), "day"))
+        );
+      });
+
+      const strikeCandidates = buildNearMoneyStrikeCandidates(row.closingPrice);
+      const previews = await Promise.all(
+        candidateExpiries.flatMap((candidateExpiry) =>
+          strikeCandidates.map(async (candidateStrike) => {
+            const preview = await getRollPreview(
+              row.date,
+              row.shortCallPrice,
+              candidateExpiry,
+              candidateStrike
+            );
+
+            return {
+              key: `${candidateExpiry}-${candidateStrike}`,
+              expiryDate: candidateExpiry,
+              strike: candidateStrike,
+              newShortCallPremium: preview.newShortCallPremium,
+              netCreditDebit: preview.netCreditDebit,
+            };
+          })
+        )
+      );
+
+      const validCandidates = previews
+        .filter(
+          (item) =>
+            item.newShortCallPremium !== null &&
+            item.netCreditDebit !== null
+        )
+        .sort((a, b) => (b.netCreditDebit ?? Number.NEGATIVE_INFINITY) - (a.netCreditDebit ?? Number.NEGATIVE_INFINITY));
+
+      const rangedCandidates = validCandidates.filter(
+        (item) =>
+          (item.netCreditDebit ?? Number.NEGATIVE_INFINITY) >= AUTO_ROLL_POPUP_MIN_NET_CREDIT_DEBIT &&
+          (item.netCreditDebit ?? Number.NEGATIVE_INFINITY) <= AUTO_ROLL_POPUP_MAX_NET_CREDIT_DEBIT
+      );
+
+      const isAfterShortExpiry = (item: RollingOptionCandidate) =>
+        dayjs(item.expiryDate).isAfter(dayjs(row.shortExpiryDate), "day");
+
+      const rangedAfterShortExpiry = rangedCandidates.filter(isAfterShortExpiry);
+      const baseCandidates = rangedCandidates.length > 0 ? rangedCandidates : validCandidates;
+      const supplementalAfterShortExpiry = validCandidates
+        .filter((item) => isAfterShortExpiry(item) && !baseCandidates.some((candidate) => candidate.key === item.key))
+        .slice(0, Math.max(0, 3 - rangedAfterShortExpiry.length));
+
+      const finalCandidates = [...baseCandidates, ...supplementalAfterShortExpiry]
+        .sort((a, b) => (b.netCreditDebit ?? Number.NEGATIVE_INFINITY) - (a.netCreditDebit ?? Number.NEGATIVE_INFINITY));
+
+      if (rangedCandidates.length === 0 && validCandidates.length > 0) {
+        message.info(
+          `No candidates found within ${formatCurrency(AUTO_ROLL_POPUP_MIN_NET_CREDIT_DEBIT)} to ${formatCurrency(AUTO_ROLL_POPUP_MAX_NET_CREDIT_DEBIT)}. Showing closest available options.`
+        );
+      }
+
+      setAutoRollCandidates(finalCandidates);
+    } finally {
+      setAutoRollCandidatesLoading(false);
+    }
+  };
+
+  const applyAutoRollCandidate = async (candidate: RollingOptionCandidate) => {
+    if (!autoRollTargetRow) {
+      return;
+    }
+
+    const nextTradingDate = getNextTradingDate(autoRollTargetRow.date);
     if (!nextTradingDate) {
       message.error("No next trading date available for this auto roll");
       return;
     }
 
-    try {
-      const targetFromDate = dayjs(row.shortExpiryDate).add(7, "day").format("YYYY-MM-DD");
-      const candidateExpiries = tradingDates.filter((value) =>
-        dayjs(value).isSame(dayjs(targetFromDate), "day") || dayjs(value).isAfter(dayjs(targetFromDate), "day")
-      );
+    const updated = [
+      ...manualRolls.filter((roll) => !dayjs(roll.fromDate).isSame(dayjs(nextTradingDate), "day")),
+      {
+        fromDate: nextTradingDate,
+        shortExpiryDate: candidate.expiryDate,
+        strike: candidate.strike,
+        rollCreditDebit: candidate.netCreditDebit,
+      },
+    ].sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
 
-      let autoRollExpiryDate: string | null = null;
-      let autoRollStrike: number | null = null;
-      let preview: RollPreview | null = null;
-      const strikeCandidates = buildStrikeCandidates(row.strike, AUTO_ROLL_MAX_STRIKE_STEPS);
-
-      for (const candidate of candidateExpiries) {
-        for (const candidateStrike of strikeCandidates) {
-          const candidatePreview = await getRollPreview(
-            row.date,
-            row.shortCallPrice,
-            candidate,
-            candidateStrike
-          );
-          if (
-            candidatePreview.newShortCallPremium !== null &&
-            candidatePreview.netCreditDebit !== null &&
-            candidatePreview.netCreditDebit >= MIN_AUTO_ROLL_CREDIT
-          ) {
-            autoRollExpiryDate = candidate;
-            autoRollStrike = candidateStrike;
-            preview = candidatePreview;
-            break;
-          }
-        }
-        if (autoRollExpiryDate && autoRollStrike !== null && preview) {
-          break;
-        }
-      }
-
-      if (!autoRollExpiryDate || autoRollStrike === null || !preview) {
-        message.error(
-          `No auto roll target found with minimum credit ${MIN_AUTO_ROLL_CREDIT.toFixed(2)} on/after +1 week`
-        );
-        return;
-      }
-
-      const updated = [
-        ...manualRolls.filter((roll) => !dayjs(roll.fromDate).isSame(dayjs(nextTradingDate), "day")),
-        {
-          fromDate: nextTradingDate,
-          shortExpiryDate: autoRollExpiryDate,
-          strike: autoRollStrike,
-          rollCreditDebit: preview.netCreditDebit,
-        },
-      ].sort((a, b) => dayjs(a.fromDate).valueOf() - dayjs(b.fromDate).valueOf());
-
-      setManualRolls(updated);
-      await runSimulation(updated);
-      message.success(
-        `Auto roll scheduled to ${autoRollExpiryDate} @ ${autoRollStrike} (credit ${formatCurrency(preview.netCreditDebit)})`
-      );
-    } catch {
-      message.error("Failed to auto roll by 1 week using available option data");
-    }
+    setManualRolls(updated);
+    setAutoRollPopoverRowKey(null);
+    await runSimulation(updated);
+    message.success(
+      `Auto roll scheduled to ${candidate.expiryDate} @ ${candidate.strike} (credit ${formatCurrency(candidate.netCreditDebit)})`
+    );
   };
 
   const runSimulation = async (activeManualRolls: ManualRollInstruction[]) => {
@@ -711,7 +768,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
           (day.isAfter(dayjs(firstDate), "day") || day.isSame(dayjs(firstDate), "day")) &&
           (day.isBefore(dayjs(simulationEndDate), "day") || day.isSame(dayjs(simulationEndDate), "day"))
         );
-      });
+      }).slice(0, MAX_SIMULATION_TRADING_DAYS);
 
       if (dates.length === 0) {
         throw new Error(`No trading dates found between ${firstDate} and ${simulationEndDate}`);
@@ -724,6 +781,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
       let entryNetCredit: number | null = null;
       let simulationStartShortCallPrice: number | null = null;
       let realisedPnl = 0;
+      let pendingRollCreditDebit: number | null = null;
       let autoRollStoppedReason: string | null = null;
 
       for (let i = 0; i < dates.length; i++) {
@@ -731,13 +789,16 @@ const CallCalendarSpreadRoll: React.FC = () => {
         const rollForToday = relevantRolls.find((roll) => dayjs(roll.fromDate).isSame(dayjs(date), "day"));
         const rolledToday = Boolean(rollForToday);
         const rollCreditDebit = rollForToday?.rollCreditDebit ?? null;
+        const previousCumulativePnl =
+          allRows.length > 0 ? (allRows[allRows.length - 1].cumulativePnl ?? realisedPnl) : realisedPnl;
 
         if (rollForToday) {
           activeShortExpiryDate = rollForToday.shortExpiryDate;
           activeStrike = roundToNearestFive(rollForToday.strike);
           entryNetCredit = null;
           rollNumber += 1;
-          realisedPnl += rollForToday.rollCreditDebit ?? 0;
+          pendingRollCreditDebit = rollForToday.rollCreditDebit ?? null;
+          realisedPnl = previousCumulativePnl + (rollForToday.rollCreditDebit ?? 0);
         }
 
         const stockResult = await fetchStockWithCache(symbol, date);
@@ -803,6 +864,8 @@ const CallCalendarSpreadRoll: React.FC = () => {
             ? entryNetCredit - currentNetCloseCost
             : 0;
 
+        const rowRollCreditDebit = rollCreditDebit ?? pendingRollCreditDebit;
+
         allRows.push({
           key: `${rollNumber}-${date}`,
           date,
@@ -813,13 +876,17 @@ const CallCalendarSpreadRoll: React.FC = () => {
           shortCallPrice,
           longCallPrice,
           entryNetCredit,
-          rollCreditDebit,
+          rollCreditDebit: rowRollCreditDebit,
           closeNetCost: status !== "active" ? closeNetCost : null,
           legPnl: status !== "active" ? legPnl : null,
           cumulativePnl: realisedPnl + unrealisedPnl,
           status,
           rollNumber,
         });
+
+        if (rowRollCreditDebit !== null) {
+          pendingRollCreditDebit = null;
+        }
 
         if (autoRollWeeklyEnabled) {
           const meetsAutoRollDecayCondition =
@@ -845,7 +912,9 @@ const CallCalendarSpreadRoll: React.FC = () => {
           );
 
           if (!hasExistingRollForNextTradingDate) {
-            const targetFromDate = dayjs(activeShortExpiryDate).add(7, "day").format("YYYY-MM-DD");
+            const targetFromDate =
+              getNextTradingDate(activeShortExpiryDate) ??
+              dayjs(activeShortExpiryDate).add(1, "day").format("YYYY-MM-DD");
             const candidateExpiries = tradingDates.filter((value) =>
               dayjs(value).isSame(dayjs(targetFromDate), "day") ||
               dayjs(value).isAfter(dayjs(targetFromDate), "day")
@@ -898,7 +967,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
         }
       }
 
-      setRows((previousRows) => mergeRows(previousRows, allRows));
+      setRows(allRows);
 
       if (autoRollStoppedReason) {
         message.warning(autoRollStoppedReason);
@@ -1142,18 +1211,25 @@ const CallCalendarSpreadRoll: React.FC = () => {
             { title: "Roll #", dataIndex: "rollNumber", key: "rollNumber", width: 70 },
             // { title: "Date", dataIndex: "date", key: "date", width: 110 },
             {
-              title: "Closing Price | Short Expiry | Strike",
+              title: "Closing Price | Short Expiry | Strike | DTE",
               key: "closeExpiryStrike",
-              width: 360,
-              render: (_: number | null, row: CallCalendarRow) => (
-                <Space size={4}>
-                  <Text>{formatCurrency(row.closingPrice)}</Text>
-                  <Text>|</Text>
-                  <Text>{row.shortExpiryDate || "-"}</Text>
-                  <Text>|</Text>
-                  <Text>{formatCurrency(row.strike)}</Text>
-                </Space>
-              ),
+              width: 460,
+              render: (_: number | null, row: CallCalendarRow) => {
+                const dte = dayjs(row.shortExpiryDate).diff(dayjs(row.date), "day");
+                const dteLabel = Number.isFinite(dte) ? `${dte}d` : "-";
+
+                return (
+                  <Space size={4}>
+                    <Text>{formatCurrency(row.closingPrice)}</Text>
+                    <Text>|</Text>
+                    <Text>{row.shortExpiryDate || "-"}</Text>
+                    <Text>|</Text>
+                    <Text>{formatCurrency(row.strike)}</Text>
+                    <Text>|</Text>
+                    <Text>{dteLabel}</Text>
+                  </Space>
+                );
+              },
             },
             // { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
             {
@@ -1330,9 +1406,98 @@ const CallCalendarSpreadRoll: React.FC = () => {
                   <Button size="small" onClick={() => openRollModal(row)} disabled={loading}>
                     Roll
                   </Button>
-                  <Button size="small" onClick={() => void handleAutoRollOneWeek(row)} disabled={loading}>
-                    Auto Roll 1W
-                  </Button>
+                  <Popover
+                    trigger="click"
+                    placement="leftTop"
+                    title="Auto Roll Candidates"
+                    overlayStyle={{ maxWidth: 1150 }}
+                    open={autoRollPopoverRowKey === row.key}
+                    onOpenChange={(open) => {
+                      if (open) {
+                        void handleAutoRollOneWeek(row);
+                        return;
+                      }
+                      if (autoRollPopoverRowKey === row.key) {
+                        closeAutoRollPopover();
+                      }
+                    }}
+                    content={(
+                      <Space direction="vertical" size={8} style={{ width: 1050 }}>
+                        <Text type="secondary">
+                          Probable rolling options for {row.date}. Minimum credit target: {formatCurrency(MIN_AUTO_ROLL_CREDIT)}
+                        </Text>
+                        <Table<RollingOptionCandidate>
+                          size="small"
+                          rowKey="key"
+                          loading={autoRollCandidatesLoading && autoRollPopoverRowKey === row.key}
+                          pagination={{ pageSize: 15 }}
+                          scroll={{ x: "max-content" }}
+                          dataSource={autoRollPopoverRowKey === row.key ? autoRollCandidates : []}
+                          locale={{ emptyText: "No probable auto roll options found." }}
+                          columns={[
+                            {
+                              title: "New Short Expiry",
+                              dataIndex: "expiryDate",
+                              key: "expiryDate",
+                              width: 130,
+                            },
+                            {
+                              title: "New DTE",
+                              key: "newDte",
+                              width: 100,
+                              render: (_: unknown, candidate: RollingOptionCandidate) => {
+                                const dte = dayjs(candidate.expiryDate).diff(dayjs(row.date), "day");
+                                return Number.isFinite(dte) ? `${dte}d` : "-";
+                              },
+                            },
+                            {
+                              title: "Strike",
+                              dataIndex: "strike",
+                              key: "strike",
+                              width: 100,
+                              render: (value: number) => formatCurrency(value),
+                            },
+                            {
+                              title: "New Premium",
+                              dataIndex: "newShortCallPremium",
+                              key: "newShortCallPremium",
+                              width: 120,
+                              render: (value: number | null) => formatCurrency(value),
+                            },
+                            {
+                              title: "Net Credit/Debit",
+                              dataIndex: "netCreditDebit",
+                              key: "netCreditDebit",
+                              render: (value: number | null) => (
+                                <Text style={{ color: (value ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                                  {formatCurrency(value)}
+                                </Text>
+                              ),
+                            },
+                            {
+                              title: "Action",
+                              key: "action",
+                              width: 110,
+                              render: (_: unknown, candidate: RollingOptionCandidate) => (
+                                <Button
+                                  size="small"
+                                  type="primary"
+                                  disabled={(candidate.netCreditDebit ?? Number.NEGATIVE_INFINITY) < MIN_AUTO_ROLL_CREDIT}
+                                  onClick={() => void applyAutoRollCandidate(candidate)}
+                                >
+                                  Apply
+                                </Button>
+                              ),
+                            },
+                          ]}
+                        />
+                      </Space>
+                    )}
+                  >
+                    <Button size="small" disabled={loading}>
+                      Auto Roll 1W
+                    </Button>
+                  </Popover>
                 </Space>
               ),
             },
@@ -1508,6 +1673,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
           </Space>
         ) : null}
       </Modal>
+
     </Space>
   );
 };
