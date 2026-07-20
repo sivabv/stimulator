@@ -383,6 +383,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
   const [showSummary, setShowSummary] = useState(true);
   const [showChart, setShowChart] = useState(true);
   const [showGrid, setShowGrid] = useState(true);
+  const [guideModalOpen, setGuideModalOpen] = useState(false);
 
   const [summary, setSummary] = useState<{
     startDate: string;
@@ -1180,6 +1181,9 @@ const PutCalendarSpreadRoll: React.FC = () => {
           >
             Auto Roll Weekly: {autoRollWeeklyEnabled ? "ON" : "OFF"}
           </Button>
+          <Button onClick={() => setGuideModalOpen(true)} disabled={loading}>
+            User Guide
+          </Button>
         </Space>
         <Space style={{ marginTop: 12 }} wrap>
           <Button onClick={() => setShowSummary((previous) => !previous)}>
@@ -1758,6 +1762,69 @@ const PutCalendarSpreadRoll: React.FC = () => {
             )}
           </Card>
         </Space>
+      </Modal>
+
+      <Modal
+        title="Put Calendar Spread User Guide"
+        open={guideModalOpen}
+        onCancel={() => setGuideModalOpen(false)}
+        footer={null}
+        width={900}
+      >
+        <div style={{ maxHeight: 560, overflowY: "auto", paddingRight: 8 }}>
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            <Text>
+              This simulator models a put calendar spread with optional manual and auto rolling.
+            </Text>
+
+            <div>
+              <Text strong>Main Inputs</Text>
+              <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                <li><Text>Start Date: first simulation date (aligned to next trading date if needed).</Text></li>
+                <li><Text>Short Expiry Date (optional): blank uses auto 15-75 DTE selection.</Text></li>
+                <li><Text>Long Expiry Date (optional): blank uses auto 150-400 DTE selection.</Text></li>
+                <li><Text>Stock ticker: underlying symbol (default MSFT, placeholder SPY).</Text></li>
+              </ul>
+            </div>
+
+            <div>
+              <Text strong>Primary Actions</Text>
+              <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                <li><Text>Run Put Calendar Spread: runs a fresh simulation and clears manual rolls.</Text></li>
+                <li><Text>Auto Roll Weekly ON/OFF: enables rolling logic when decay or near-expiry conditions are met.</Text></li>
+                <li><Text>Show/Hide Summary, Chart, Grid: toggles output sections.</Text></li>
+              </ul>
+            </div>
+
+            <div>
+              <Text strong>Grid Actions</Text>
+              <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                <li><Text>Roll: opens a modal to set next short expiry and strike, with roll credit/debit preview.</Text></li>
+                <li><Text>Auto Roll 1W: opens probable roll candidates; choose Apply to schedule and rerun.</Text></li>
+                <li><Text>Click short/long put price links to view leg details and rolling option ideas.</Text></li>
+              </ul>
+            </div>
+
+            <div>
+              <Text strong>Key Outputs</Text>
+              <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                <li><Text>Summary: stock return vs option strategy return (amount and percentage).</Text></li>
+                <li><Text>Option Price Chart: short put and long put prices by date.</Text></li>
+                <li><Text>Records: close price, expiry, strike, DTE, theta/day, and cumulative P&L.</Text></li>
+                <li><Text>Status lines: processed simulation count and latest auto-saved checkpoint.</Text></li>
+              </ul>
+            </div>
+
+            <div>
+              <Text strong>Common Prompts and Warnings</Text>
+              <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                <li><Text>Validation: invalid dates, missing ticker, invalid strike, missing next trading date.</Text></li>
+                <li><Text>Rate limits: 429 warning retries with 2-second waits.</Text></li>
+                <li><Text>Auto-roll stop warnings when no valid credit target or no next trading date exists.</Text></li>
+              </ul>
+            </div>
+          </Space>
+        </div>
       </Modal>
 
     </Space>

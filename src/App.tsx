@@ -30,6 +30,7 @@ const CalendarSpreadRollSplit = lazy(() => import("./components/CalendarSpreadRo
 const LocalFullScreenCharts = lazy(() => import("./components/LocalFullScreenCharts"));
 const ChartsAndLink = lazy(() => import("./components/ChartsAndLink"));
 const ChartsAndLinkV2 = lazy(() => import("./components/ChartsAndLinkV2"));
+const FutureChart = lazy(() => import("./components/FutureChart"));
 
 const App: React.FC = () => {
   // Backtest state
@@ -370,6 +371,15 @@ const App: React.FC = () => {
                 children: (
                   <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
                     <ChartsAndLink />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "future-chart",
+                label: "Future Chart",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <FutureChart />
                   </Suspense>
                 ),
               },
