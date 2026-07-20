@@ -182,6 +182,34 @@ Auto-roll stop warnings:
 6. Toggle `Auto Roll Weekly: ON` if you want continuous rolling behavior.
 7. Re-run and compare cumulative P&L changes.
 
+## 8.1) Step-by-step with screenshots
+
+### Step 1: Open the Put Calendar Spread Roll tab
+
+![Step 1 - Open Put Calendar Spread Roll tab](docs/images/put-calendar-guide/step-1-open-put-calendar-tab.png)
+
+### Step 2: Set ticker to SPY
+
+![Step 2 - Set ticker to SPY](docs/images/put-calendar-guide/step-2-set-spy-ticker.png)
+
+### Step 3: Run simulation
+
+Click `Run Put Calendar Spread` to execute a fresh run.
+
+![Step 3 - Run simulation](docs/images/put-calendar-guide/step-3-run-simulation.png)
+
+### Step 4: Review summary metrics
+
+Check start/end dates, stock return, and option strategy return.
+
+![Step 4 - Review summary](docs/images/put-calendar-guide/step-4-review-summary.png)
+
+### Step 5: Review chart and records grid
+
+Inspect option price trend and row-wise P&L/action data.
+
+![Step 5 - Chart and records](docs/images/put-calendar-guide/step-5-chart-and-records.png)
+
 ## 9) Important simulation limits and defaults
 
 - Trading dates come from bundled trading date datasets.

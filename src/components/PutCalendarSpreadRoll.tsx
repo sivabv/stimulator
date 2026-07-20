@@ -1285,12 +1285,25 @@ const PutCalendarSpreadRoll: React.FC = () => {
 
       {showGrid && (
         <Card title="Records">
+          <style>
+            {`
+              .put-calendar-compact-grid .ant-table-thead > tr > th,
+              .put-calendar-compact-grid .ant-table-tbody > tr > td {
+                padding: 6px 8px;
+              }
+
+              .put-calendar-compact-grid .ant-table-thead > tr > th {
+                line-height: 1.2;
+              }
+            `}
+          </style>
           <Table<PutCalendarRow>
+            className="put-calendar-compact-grid"
             rowKey="key"
             loading={loading}
             dataSource={rows}
             pagination={{ pageSize: 50, showSizeChanger: true }}
-            scroll={{ x: "max-content" }}
+            scroll={{ x: 980 }}
             columns={[
             // { title: "Roll #", dataIndex: "rollNumber", key: "rollNumber", width: 70 },
             // { title: "Date", dataIndex: "date", key: "date", width: 110 },
@@ -1309,15 +1322,21 @@ const PutCalendarSpreadRoll: React.FC = () => {
             //   render: (v: number) => formatCurrency(v),
             // },
             {
-              title: "Closing Price | Short Expiry | Strike | DTE",
+              title: (
+                <span>
+                  Closing Price |
+                  <br />
+                  Short Expiry | Strike | DTE
+                </span>
+              ),
               key: "closeExpiryStrike",
-              width: 460,
+              width: 320,
               render: (_: number | null, row: PutCalendarRow) => {
                 const dte = dayjs(row.shortExpiryDate).diff(dayjs(row.date), "day");
                 const dteLabel = Number.isFinite(dte) ? `${dte}d` : "-";
 
                 return (
-                  <Space size={4}>
+                  <Space size={2}>
                     <Text>{formatCurrency(row.closingPrice)}</Text>
                     <Text>|</Text>
                     <Text>{row.shortExpiryDate || "-"}</Text>
@@ -1331,9 +1350,15 @@ const PutCalendarSpreadRoll: React.FC = () => {
             },
             // { title: "Long Expiry", dataIndex: "longExpiryDate", key: "longExpiryDate", width: 120 },
             {
-              title: "Put Price (Short | Long)",
+              title: (
+                <span>
+                  Put Price
+                  <br />
+                  (Short | Long)
+                </span>
+              ),
               key: "putPriceCombined",
-              width: 260,
+              width: 190,
               render: (_: number | null, row: PutCalendarRow) => {
                 const shortPut =
                   row.shortPutPrice !== null ? (
@@ -1364,7 +1389,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
                   );
 
                 return (
-                  <Space size={4}>
+                  <Space size={2}>
                     {shortPut}
                     <Text>|</Text>
                     {longPut}
@@ -1373,9 +1398,15 @@ const PutCalendarSpreadRoll: React.FC = () => {
               },
             },
             {
-              title: "Theta/Day (Short | Long)",
+              title: (
+                <span>
+                  Theta/Day
+                  <br />
+                  (Short | Long)
+                </span>
+              ),
               key: "thetaPerDay",
-              width: 320,
+              width: 220,
               render: (_: number | null, row: PutCalendarRow) => {
                 const shortTheta = calculateThetaPerDay(
                   row.shortPutPrice,
@@ -1408,7 +1439,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
                 };
 
                 return (
-                  <Space size={4} wrap>
+                  <Space size={2} wrap>
                     <Text>{formatCurrency(shortTheta)}</Text>
                     <Text>|</Text>
                     <Text>{formatCurrency(longTheta)}</Text>
@@ -1448,9 +1479,15 @@ const PutCalendarSpreadRoll: React.FC = () => {
             //     ),
             // },
             {
-              title: "Cumulative P&L (Roll Credit/Debit)",
+              title: (
+                <span>
+                  Cumulative P&amp;L
+                  <br />
+                  (Roll Credit/Debit)
+                </span>
+              ),
               key: "cumulativeWithRoll",
-              width: 260,
+              width: 220,
               render: (_: number | null, row: PutCalendarRow) => {
                 const cumulative = row.cumulativePnl;
                 const roll = row.rollCreditDebit;
@@ -1472,7 +1509,7 @@ const PutCalendarSpreadRoll: React.FC = () => {
                 ) : null;
 
                 return (
-                  <Space size={4} wrap>
+                  <Space size={2} wrap>
                     {cumulativeNode}
                     {hasRoll ? <Text>(</Text> : null}
                     {rollNode}
@@ -1495,9 +1532,15 @@ const PutCalendarSpreadRoll: React.FC = () => {
             //   onFilter: (value, record) => record.status === value,
             // },
             {
-              title: "Action",
+              title: (
+                <span>
+                  Row
+                  <br />
+                  Action
+                </span>
+              ),
               key: "action",
-              width: 220,
+              width: 160,
               render: (_: unknown, row: PutCalendarRow) => (
                 <Space size={8}>
                   <Button size="small" onClick={() => openRollModal(row)} disabled={loading}>
