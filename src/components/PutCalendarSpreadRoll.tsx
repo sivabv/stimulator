@@ -35,6 +35,11 @@ import {
 } from "../api/backtest";
 import tradingDatesJson from "../assets/trading_dates_2026.json";
 import spyClosingData from "../assets/spy-closing.json";
+import guideStep1Image from "../../docs/images/put-calendar-guide/step-1-open-put-calendar-tab.png";
+import guideStep2Image from "../../docs/images/put-calendar-guide/step-2-set-spy-ticker.png";
+import guideStep3Image from "../../docs/images/put-calendar-guide/step-3-run-simulation.png";
+import guideStep4Image from "../../docs/images/put-calendar-guide/step-4-review-summary.png";
+import guideStep5Image from "../../docs/images/put-calendar-guide/step-5-chart-and-records.png";
 
 const { Text } = Typography;
 
@@ -1865,6 +1870,56 @@ const PutCalendarSpreadRoll: React.FC = () => {
                 <li><Text>Rate limits: 429 warning retries with 2-second waits.</Text></li>
                 <li><Text>Auto-roll stop warnings when no valid credit target or no next trading date exists.</Text></li>
               </ul>
+            </div>
+
+            <div>
+              <Text strong>Step-by-step Screenshots</Text>
+              <Space direction="vertical" size={10} style={{ width: "100%", marginTop: 8 }}>
+                <div>
+                  <Text strong>Step 1: Open Put Calendar Spread Roll tab</Text>
+                  <img
+                    src={guideStep1Image}
+                    alt="Step 1 - Open Put Calendar Spread Roll tab"
+                    style={{ width: "100%", marginTop: 6, borderRadius: 6, border: "1px solid #f0f0f0" }}
+                  />
+                </div>
+
+                <div>
+                  <Text strong>Step 2: Set ticker to SPY</Text>
+                  <img
+                    src={guideStep2Image}
+                    alt="Step 2 - Set ticker to SPY"
+                    style={{ width: "100%", marginTop: 6, borderRadius: 6, border: "1px solid #f0f0f0" }}
+                  />
+                </div>
+
+                <div>
+                  <Text strong>Step 3: Click Run Put Calendar Spread</Text>
+                  <img
+                    src={guideStep3Image}
+                    alt="Step 3 - Run simulation"
+                    style={{ width: "100%", marginTop: 6, borderRadius: 6, border: "1px solid #f0f0f0" }}
+                  />
+                </div>
+
+                <div>
+                  <Text strong>Step 4: Review Summary metrics</Text>
+                  <img
+                    src={guideStep4Image}
+                    alt="Step 4 - Review summary"
+                    style={{ width: "100%", marginTop: 6, borderRadius: 6, border: "1px solid #f0f0f0" }}
+                  />
+                </div>
+
+                <div>
+                  <Text strong>Step 5: Review Chart and Records grid</Text>
+                  <img
+                    src={guideStep5Image}
+                    alt="Step 5 - Chart and records"
+                    style={{ width: "100%", marginTop: 6, borderRadius: 6, border: "1px solid #f0f0f0" }}
+                  />
+                </div>
+              </Space>
             </div>
           </Space>
         </div>
