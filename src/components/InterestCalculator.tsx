@@ -34,6 +34,7 @@ interface AnalysisRow {
 	delta: number | null;
 	interestPercentage: number | null;
 	annualInterestRate: number | null;
+	annualStockInterestRate: number | null;
 	thetaPerDay: number | null;
 	intrinsicValue: number | null;
 	extrinsicValue: number | null;
@@ -311,6 +312,7 @@ const InterestCalculator: React.FC = () => {
 			delta: null,
 			interestPercentage: null,
 			annualInterestRate: null,
+			annualStockInterestRate: null,
 			thetaPerDay: null,
 			intrinsicValue: null,
 			extrinsicValue: null,
@@ -336,6 +338,13 @@ const InterestCalculator: React.FC = () => {
 			const annualInterestRate =
 				interestPercentage !== null && seededRow.daysToExpiry > 0
 					? interestPercentage * (365 / seededRow.daysToExpiry)
+					: null;
+			const annualStockInterestRate =
+				optionClose !== null &&
+				seededRow.stockClose !== null &&
+				seededRow.stockClose > 0 &&
+				seededRow.daysToExpiry > 0
+					? (optionClose / seededRow.stockClose) * (365 / seededRow.daysToExpiry) * 100
 					: null;
 			const delta = calculateDelta(
 				optionClose,
@@ -371,6 +380,7 @@ const InterestCalculator: React.FC = () => {
 							delta,
 							interestPercentage,
 							annualInterestRate,
+							annualStockInterestRate,
 							thetaPerDay,
 							intrinsicValue,
 							extrinsicValue,
@@ -626,6 +636,13 @@ const InterestCalculator: React.FC = () => {
 							title: "Days to expiry",
 							dataIndex: "daysToExpiry",
 							key: "daysToExpiry",
+						},
+						{
+							title: "Annual rate vs stock",
+							dataIndex: "annualStockInterestRate",
+							key: "annualStockInterestRate",
+							render: (value: number | null) =>
+								value !== null && Number.isFinite(value) ? `${value.toFixed(2)}%` : "-",
 						},
 					
 						{
