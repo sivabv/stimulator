@@ -31,13 +31,16 @@ const LocalFullScreenCharts = lazy(() => import("./components/LocalFullScreenCha
 const ChartsAndLink = lazy(() => import("./components/ChartsAndLink"));
 const ChartsAndLinkV2 = lazy(() => import("./components/ChartsAndLinkV2"));
 const FutureChart = lazy(() => import("./components/FutureChart"));
+const ThreeTier = lazy(() => import("./components/ThreeTier"));
 
 const App: React.FC = () => {
   // Backtest state
   const [result, setResult] = useState<BacktestResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState("trade-links");
+  const [activeTab, setActiveTab] = useState(
+    () => new URLSearchParams(window.location.search).get("tab") ?? "three-tier"
+  );
   const [dbStatusOpen, setDbStatusOpen] = useState(false);
   const [dbStatusLoading, setDbStatusLoading] = useState(false);
   const [dbStatus, setDbStatus] = useState<{
@@ -380,6 +383,15 @@ const App: React.FC = () => {
                 children: (
                   <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
                     <FutureChart />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "three-tier",
+                label: "3 Tier",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <ThreeTier />
                   </Suspense>
                 ),
               },

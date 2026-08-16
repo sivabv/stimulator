@@ -234,11 +234,41 @@ export async function fetchStockOpenClose(
     };
   }
 
-  return {
-    openPrice: null,
-    closePrice: null,
-    delta: null,
-    theta: null,
-    statusCode: 404,
-  };
+  try {
+    const params = new URLSearchParams({ adjusted: "true", apiKey: MASSIVE_API_KEY });
+    const response = await fetch(
+      `${MASSIVE_BASE_URL}/${encodeURIComponent(normalizedSymbol)}/${date}?${params}`
+    );
+
+    if (!response.ok) {
+      console.warn(
+        `Failed to fetch stock price for ${normalizedSymbol} on ${date}: ${response.status}`
+      );
+      return {
+        openPrice: null,
+        closePrice: null,
+        delta: null,
+        theta: null,
+        statusCode: response.status,
+      };
+    }
+
+    const data = await response.json();
+    return {
+      openPrice: data.open ?? data.o ?? null,
+      closePrice: data.close ?? data.c ?? null,
+      delta: null,
+      theta: null,
+      statusCode: response.status,
+    };
+  } catch (error) {
+    console.error(`Error fetching stock price for ${normalizedSymbol} on ${date}:`, error);
+    return {
+      openPrice: null,
+      closePrice: null,
+      delta: null,
+      theta: null,
+      statusCode: null,
+    };
+  }
 }
