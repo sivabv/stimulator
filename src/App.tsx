@@ -4,7 +4,7 @@
  * managing the backtest request lifecycle and error display.
  */
 
-import React, { Suspense, lazy, useState } from "react";
+import React, { Suspense, lazy, useEffect, useState } from "react";
 import { Layout, Typography, Alert, Spin, ConfigProvider, theme, Tabs, Button, Modal, Descriptions, Space } from "antd";
 import { DownloadOutlined } from "@ant-design/icons";
 import FilterBar from "./components/FilterBar";
@@ -38,9 +38,31 @@ const App: React.FC = () => {
   const [result, setResult] = useState<BacktestResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState(
-    () => new URLSearchParams(window.location.search).get("tab") ?? "three-tier"
-  );
+  const [activeTab, setActiveTab] = useState(() => {
+    const tab = new URLSearchParams(window.location.search).get("tab");
+    return tab ?? "interest-calculator";
+  });
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const currentTab = url.searchParams.get("tab");
+
+    if (currentTab !== activeTab) {
+      url.searchParams.set("tab", activeTab);
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const nextTab = new URLSearchParams(window.location.search).get("tab") ?? "interest-calculator";
+      setActiveTab(nextTab);
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
   const [dbStatusOpen, setDbStatusOpen] = useState(false);
   const [dbStatusLoading, setDbStatusLoading] = useState(false);
   const [dbStatus, setDbStatus] = useState<{

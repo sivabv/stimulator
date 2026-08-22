@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
 	Alert,
 	Button,
@@ -41,7 +41,7 @@ interface AnalysisRow {
 	statusCode: number | null;
 }
 
-const RATE_LIMIT_WAIT_MS = 2_000;
+const RATE_LIMIT_WAIT_MS = 65_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const tradingDates = tradingDatesJson as string[];
 
@@ -215,7 +215,7 @@ const formatCurrency = (value: number | null) => {
 
 const InterestCalculator: React.FC = () => {
 	const [symbol, setSymbol] = useState("SPY");
-	const [startDate, setStartDate] = useState("2025-06-20");
+	const [startDate, setStartDate] = useState("2026-01-05");
 	const [strikePrice, setStrikePrice] = useState<number | null>(null);
 	const [optionType, setOptionType] = useState<OptionType>("P");
 	const [loading, setLoading] = useState(false);
@@ -242,7 +242,7 @@ const InterestCalculator: React.FC = () => {
 
 		while (response.statusCode === 429 && attempts < MAX_RATE_LIMIT_RETRIES) {
 			attempts += 1;
-			message.warning(`Rate limit hit (429). Waiting 2 seconds before retry ${attempts}.`);
+			message.warning(`Rate limit hit (429). Waiting 65 seconds before retry ${attempts}.`);
 			await sleep(RATE_LIMIT_WAIT_MS);
 			response = await work();
 		}
@@ -465,6 +465,10 @@ const InterestCalculator: React.FC = () => {
 			setLoading(false);
 		}
 	};
+
+	useEffect(() => {
+		void handleAnalyze();
+	}, []);
 
 	const rowsWithData = rows.filter((row) => row.optionClose !== null);
 	const visibleRows = rowsWithData.slice(0, 50);
