@@ -11,10 +11,11 @@ import {
 	Select,
 	Space,
 	Table,
+	Tooltip,
 	Typography,
 	message,
 } from "antd";
-import { PlayCircleOutlined, AimOutlined } from "@ant-design/icons";
+import { PlayCircleOutlined, AimOutlined, InfoCircleOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
 import tradingDatesJson from "../assets/trading_dates_2026.json";
@@ -41,8 +42,19 @@ interface AnalysisRow {
 	statusCode: number | null;
 }
 
+interface SavedInterestSimulation {
+	symbol: string;
+	startDate: string;
+	strikePrice: number | null;
+	optionType: OptionType;
+	savedAt: string;
+	rows: AnalysisRow[];
+}
+
 const RATE_LIMIT_WAIT_MS = 65_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
+const INTEREST_CALCULATOR_SNAPSHOT_KEY = "interestCalculatorSavedSimulation";
+const INTEREST_CALCULATOR_SAVED_SIMULATIONS_KEY = "interestCalculatorSavedSimulations";
 const tradingDates = tradingDatesJson as string[];
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -221,6 +233,7 @@ const InterestCalculator: React.FC = () => {
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [rows, setRows] = useState<AnalysisRow[]>([]);
+	const [savedSimulations, setSavedSimulations] = useState<SavedInterestSimulation[]>([]);
 
 	const observationDates = useMemo(() => {
 		const start = dayjs(startDate);
@@ -279,7 +292,7 @@ const InterestCalculator: React.FC = () => {
 		return null;
 	};
 
-	const analyzeInterest = async (nextStrikePrice: number) => {
+	const analyzeInterest = async (nextStrikePrice: number): Promise<AnalysisRow[]> => {
 		const normalizedSymbol = symbol.trim().toUpperCase();
 
 		if (!normalizedSymbol) {
@@ -319,9 +332,11 @@ const InterestCalculator: React.FC = () => {
 			statusCode: null,
 		}));
 
-		setRows(seededRows);
+		const finalRows: AnalysisRow[] = seededRows.map((row) => ({ ...row }));
+		setRows(finalRows);
 
-		for (const seededRow of seededRows) {
+		for (let index = 0; index < seededRows.length; index += 1) {
+			const seededRow = seededRows[index];
 			const optionData = await fetchWithRateLimitRetry(() =>
 				fetchOptionOpenClose(
 					normalizedSymbol,
@@ -371,25 +386,23 @@ const InterestCalculator: React.FC = () => {
 			const extrinsicValue =
 				optionClose !== null && intrinsicValue !== null ? Math.max(optionClose - intrinsicValue, 0) : null;
 
-			setRows((previousRows) =>
-				previousRows.map((row) =>
-					row.key === seededRow.key
-						? {
-							...row,
-							optionClose,
-							delta,
-							interestPercentage,
-							annualInterestRate,
-							annualStockInterestRate,
-							thetaPerDay,
-							intrinsicValue,
-							extrinsicValue,
-							statusCode: optionData.statusCode,
-						}
-						: row
-				)
-			);
+			finalRows[index] = {
+				...finalRows[index],
+				optionClose,
+				delta,
+				interestPercentage,
+				annualInterestRate,
+				annualStockInterestRate,
+				thetaPerDay,
+				intrinsicValue,
+				extrinsicValue,
+				statusCode: optionData.statusCode,
+			};
+
+			setRows(finalRows.map((row) => ({ ...row })));
 		}
+
+		return finalRows;
 	};
 
 	const handlePickCurrentStrike = async () => {
@@ -416,7 +429,8 @@ const InterestCalculator: React.FC = () => {
 
 			const roundedStrike = roundToNearestFive(previousClose.price);
 			setStrikePrice(roundedStrike);
-			await analyzeInterest(roundedStrike);
+			const finalRows = await analyzeInterest(roundedStrike);
+			handleSaveSimulation(finalRows);
 			message.success(`Picked strike ${roundedStrike} from ${normalizedSymbol} previous close ${previousClose.date} = ${previousClose.price.toFixed(2)} and refreshed option data.`);
 		} catch (err) {
 			const nextError = err instanceof Error ? err.message : "Failed to load current strike price";
@@ -457,7 +471,8 @@ const InterestCalculator: React.FC = () => {
 				message.info(`Auto-picked strike ${strikeToUse} from ${normalizedSymbol} previous close ${previousClose.date} = ${previousClose.price.toFixed(2)}.`);
 			}
 
-			await analyzeInterest(strikeToUse);
+			const finalRows = await analyzeInterest(strikeToUse);
+			handleSaveSimulation(finalRows);
 		} catch (err) {
 			const nextError = err instanceof Error ? err.message : "Failed to analyze interest";
 			setError(nextError);
@@ -466,8 +481,113 @@ const InterestCalculator: React.FC = () => {
 		}
 	};
 
+	const readSavedSimulations = (): SavedInterestSimulation[] => {
+		if (typeof window === "undefined") {
+			return [];
+		}
+
+		try {
+			const raw = window.localStorage.getItem(INTEREST_CALCULATOR_SAVED_SIMULATIONS_KEY);
+			if (!raw) {
+				const legacyRaw = window.localStorage.getItem(INTEREST_CALCULATOR_SNAPSHOT_KEY);
+				if (!legacyRaw) {
+					return [];
+				}
+
+				const legacySaved = JSON.parse(legacyRaw) as Partial<SavedInterestSimulation>;
+				if (!legacySaved || typeof legacySaved !== "object" || !Array.isArray((legacySaved as any).rows)) {
+					return [];
+				}
+
+				return [legacySaved as SavedInterestSimulation];
+			}
+
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed)) {
+				return parsed.filter(
+					(saved): saved is SavedInterestSimulation =>
+						!!saved && typeof saved === "object" && Array.isArray((saved as any).rows)
+				);
+			}
+
+			if (parsed && typeof parsed === "object" && Array.isArray((parsed as any).rows)) {
+				return [parsed as SavedInterestSimulation];
+			}
+
+			return [];
+		} catch {
+			return [];
+		}
+	};
+
+	const restoreSavedSimulation = (target?: SavedInterestSimulation): boolean => {
+		if (typeof window === "undefined") {
+			return false;
+		}
+
+		try {
+			const saved = target ??
+				(() => {
+					const list = readSavedSimulations();
+					return list[list.length - 1];
+				})();
+
+			if (!saved || typeof saved !== "object" || !Array.isArray(saved.rows)) {
+				return false;
+			}
+
+			setSymbol(typeof saved.symbol === "string" ? saved.symbol : "SPY");
+			setStartDate(typeof saved.startDate === "string" ? saved.startDate : "2026-01-05");
+			setStrikePrice(typeof saved.strikePrice === "number" ? saved.strikePrice : null);
+			setOptionType(saved.optionType === "C" ? "C" : "P");
+			setRows(saved.rows as AnalysisRow[]);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+
+	const handleSaveSimulation = (nextRows?: AnalysisRow[]) => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		const snapshotRows = (nextRows ?? rows).filter((row) => row.optionClose !== null);
+		const snapshot: SavedInterestSimulation = {
+			symbol: symbol.trim().toUpperCase() || "SPY",
+			startDate,
+			strikePrice,
+			optionType,
+			savedAt: new Date().toISOString(),
+			rows: snapshotRows,
+		};
+
+		try {
+			const currentEntries = readSavedSimulations();
+			const nextEntries = [snapshot, ...currentEntries.filter((entry) => entry.savedAt !== snapshot.savedAt)];
+			window.localStorage.setItem(INTEREST_CALCULATOR_SAVED_SIMULATIONS_KEY, JSON.stringify(nextEntries));
+			window.localStorage.setItem(INTEREST_CALCULATOR_SNAPSHOT_KEY, JSON.stringify(snapshot));
+			setSavedSimulations(nextEntries);
+			message.success("Simulation saved locally.");
+		} catch {
+			setError("Could not save simulation to local storage.");
+		}
+	};
+
 	useEffect(() => {
-		void handleAnalyze();
+		const initialSaved = readSavedSimulations();
+		setSavedSimulations(initialSaved);
+
+		if (initialSaved.length > 0) {
+			const latestSaved = initialSaved[0];
+			restoreSavedSimulation(latestSaved);
+			return;
+		}
+
+		const restored = restoreSavedSimulation();
+		if (!restored) {
+			void handleAnalyze();
+		}
 	}, []);
 
 	const rowsWithData = rows.filter((row) => row.optionClose !== null);
@@ -503,11 +623,20 @@ const InterestCalculator: React.FC = () => {
 
 					<Col xs={24} md={8}>
 						<Text>Start date</Text>
-						<DatePicker
-							value={dayjs(startDate)}
-							onChange={(value) => setStartDate(value ? value.format("YYYY-MM-DD") : "")}
-							style={{ width: "100%", marginTop: 8 }}
-						/>
+						<Space direction="vertical" style={{ width: "100%" }}>
+							<DatePicker
+								value={dayjs(startDate)}
+								onChange={(value) => setStartDate(value ? value.format("YYYY-MM-DD") : "")}
+								style={{ width: "100%", marginTop: 8 }}
+							/>
+							<Button
+								size="small"
+								type="default"
+								style={{ minWidth: 72 }}
+							>
+								{dayjs(startDate).isValid() ? dayjs(startDate).format("MM/DD") : "MM/DD"}
+							</Button>
+						</Space>
 					</Col>
 
 					<Col xs={24} md={8}>
@@ -535,31 +664,42 @@ const InterestCalculator: React.FC = () => {
 					</Col>
 
 					<Col xs={24} md={8}>
-						<Text>Expiry rows</Text>
-						<Descriptions
-							column={1}
-							size="small"
-							bordered
-							style={{ marginTop: 8 }}
-							items={[
-								{
-									key: "count",
-									label: "Expiry rows",
-									children: observationDates.length,
-								},
-								{
-									key: "window",
-									label: "Window end",
-									children:
-										observationDates[observationDates.length - 1] ?? "2026-12-31",
-								},
-								{
-									key: "start",
-									label: "Fixed pricing date",
-									children: startDate,
-								},
-							]}
-						/>
+						<Text>
+							Expiry rows
+							<Tooltip
+								placement="right"
+								title={
+									<Descriptions
+										column={1}
+										size="small"
+										bordered
+										style={{ marginTop: 0 }}
+										items={[
+											{
+												key: "count",
+												label: "Expiry rows",
+												children: observationDates.length,
+											},
+											{
+												key: "window",
+												label: "Window end",
+												children:
+													observationDates[observationDates.length - 1] ?? "2026-12-31",
+											},
+											{
+												key: "start",
+												label: "Fixed pricing date",
+												children: startDate,
+											},
+										]}
+									/>
+								}
+							>
+								<InfoCircleOutlined
+									style={{ marginLeft: 8, color: "#1677ff", cursor: "pointer" }}
+								/>
+							</Tooltip>
+						</Text>
 					</Col>
 				</Row>
 
@@ -567,10 +707,36 @@ const InterestCalculator: React.FC = () => {
 					<Button icon={<AimOutlined />} onClick={handlePickCurrentStrike} loading={loading}>
 						Pick Current Strike
 					</Button>
+					<Button
+						onClick={() => handleSaveSimulation(rows)}
+						disabled={loading || rows.length === 0}
+					>
+						Save Simulation
+					</Button>
 					<Button type="primary" icon={<PlayCircleOutlined />} onClick={handleAnalyze} loading={loading}>
 						Analyze Interest
 					</Button>
 				</Space>
+
+				{savedSimulations.length > 0 && (
+					<Space style={{ marginTop: 16 }} wrap>
+						{savedSimulations.map((saved, index) => (
+							<Button
+								key={`${saved.savedAt}-${index}`}
+								type={saved.startDate === startDate ? "primary" : "default"}
+								onClick={() => {
+									setSymbol(saved.symbol);
+									setStartDate(saved.startDate);
+									setStrikePrice(saved.strikePrice);
+									setOptionType(saved.optionType);
+									setRows(saved.rows);
+								}}
+							>
+								{dayjs(saved.startDate).isValid() ? dayjs(saved.startDate).format("MM/DD") : "MM/DD"}
+							</Button>
+						))}
+					</Space>
+				)}
 			</Card>
 
 			{error && <Alert type="error" showIcon message="Interest Analysis Error" description={error} />}

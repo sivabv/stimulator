@@ -5,7 +5,7 @@
  */
 
 import React, { Suspense, lazy, useEffect, useState } from "react";
-import { Layout, Typography, Alert, Spin, ConfigProvider, theme, Tabs, Button, Modal, Descriptions, Space } from "antd";
+import { Layout, Typography, Alert, Spin, ConfigProvider, theme, Tabs, Button, Modal, Descriptions, Space, Result } from "antd";
 import { DownloadOutlined } from "@ant-design/icons";
 import FilterBar from "./components/FilterBar";
 import ResultsTable from "./components/ResultsTable";
@@ -33,6 +33,33 @@ const ChartsAndLinkV2 = lazy(() => import("./components/ChartsAndLinkV2"));
 const FutureChart = lazy(() => import("./components/FutureChart"));
 const ThreeTier = lazy(() => import("./components/ThreeTier"));
 
+const PAGE_NOT_FOUND_KEY = "page-not-found";
+const VALID_TABS = new Set([
+  "trade-links",
+  "backtest",
+  "charts-and-link-v2",
+  "options-analyzer",
+  "options-analyser-v2",
+  "interest-calculator",
+  "weekly-straddle-roll",
+  "straddle-rolling",
+  "put-calendar-spread-roll",
+  "call-calendar-spread-roll",
+  "calendar-spread-roll-split",
+  "local-full-screen-charts",
+  "charts-and-link",
+  "future-chart",
+  "three-tier",
+]);
+
+const PageNotFound: React.FC = () => (
+  <Result
+    status="404"
+    title="Page not found"
+    subTitle="The requested page does not exist."
+  />
+);
+
 const App: React.FC = () => {
   // Backtest state
   const [result, setResult] = useState<BacktestResponse | null>(null);
@@ -40,23 +67,31 @@ const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState(() => {
     const tab = new URLSearchParams(window.location.search).get("tab");
-    return tab ?? "interest-calculator";
+    return tab && VALID_TABS.has(tab) ? tab : PAGE_NOT_FOUND_KEY;
   });
 
-  useEffect(() => {
+  const syncTabState = (nextTab: string) => {
     const url = new URL(window.location.href);
-    const currentTab = url.searchParams.get("tab");
 
-    if (currentTab !== activeTab) {
-      url.searchParams.set("tab", activeTab);
-      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    if (nextTab === PAGE_NOT_FOUND_KEY) {
+      url.searchParams.delete("tab");
+    } else {
+      url.searchParams.set("tab", nextTab);
+    }
+
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  };
+
+  useEffect(() => {
+    if (activeTab !== PAGE_NOT_FOUND_KEY) {
+      syncTabState(activeTab);
     }
   }, [activeTab]);
 
   useEffect(() => {
     const handlePopState = () => {
-      const nextTab = new URLSearchParams(window.location.search).get("tab") ?? "interest-calculator";
-      setActiveTab(nextTab);
+      const nextTab = new URLSearchParams(window.location.search).get("tab");
+      setActiveTab(nextTab && VALID_TABS.has(nextTab) ? nextTab : PAGE_NOT_FOUND_KEY);
     };
 
     window.addEventListener("popstate", handlePopState);
@@ -204,25 +239,31 @@ const App: React.FC = () => {
       }}
     >
       <Layout style={{ minHeight: "100vh" }}>
-        {/* App header */}
-        <Header
-          style={{
-            background: "#001529",
-            display: "flex",
-            alignItems: "center",
-            padding: "0 24px",
-          }}
-        >
-          <Title level={3} style={{ color: "#fff", margin: 0 }}>
-            Options Backtesting Dashboard
-          </Title>
-        </Header>
+        {activeTab !== PAGE_NOT_FOUND_KEY && (
+          <Header
+            style={{
+              background: "#001529",
+              display: "flex",
+              alignItems: "center",
+              padding: "0 24px",
+            }}
+          >
+            <Title level={3} style={{ color: "#fff", margin: 0 }}>
+              Options Backtesting Dashboard
+            </Title>
+          </Header>
+        )}
 
-        <Content style={{ padding: "24px 24px 0" }}>
-          {/* Tab navigation */}
-          <Tabs
+        <Content style={{ padding: activeTab === PAGE_NOT_FOUND_KEY ? "24px" : "24px 24px 0" }}>
+          {activeTab === PAGE_NOT_FOUND_KEY ? (
+            <PageNotFound />
+          ) : (
+            <Tabs
             activeKey={activeTab}
-            onChange={setActiveTab}
+            onChange={(tabKey) => {
+              setActiveTab(tabKey);
+              syncTabState(tabKey);
+            }}
             items={[
               {
                 key: "trade-links",
@@ -421,33 +462,38 @@ const App: React.FC = () => {
 
             ]}
           />
+          )}
         </Content>
 
-        <Footer style={{ textAlign: "center" }}>
-          Backtesting Dashboard · Built with FastAPI + React + Ant Design
-        </Footer>
+        {activeTab !== PAGE_NOT_FOUND_KEY && (
+          <>
+            <Footer style={{ textAlign: "center" }}>
+              Backtesting Dashboard · Built with FastAPI + React + Ant Design
+            </Footer>
 
-        <Space
-          direction="vertical"
-          size={8}
-          style={{
-            position: "fixed",
-            right: 24,
-            bottom: 24,
-            zIndex: 1000,
-          }}
-        >
-          <Button onClick={handleOpenDbStatus} loading={dbStatusLoading}>
-            DB Status
-          </Button>
-          <Button
-            type="primary"
-            icon={<DownloadOutlined />}
-            onClick={handleDownloadLocalStorage}
-          >
-            Download Local Data
-          </Button>
-        </Space>
+            <Space
+              direction="vertical"
+              size={8}
+              style={{
+                position: "fixed",
+                right: 24,
+                bottom: 24,
+                zIndex: 1000,
+              }}
+            >
+              <Button onClick={handleOpenDbStatus} loading={dbStatusLoading}>
+                DB Status
+              </Button>
+              <Button
+                type="primary"
+                icon={<DownloadOutlined />}
+                onClick={handleDownloadLocalStorage}
+              >
+                Download Local Data
+              </Button>
+            </Space>
+          </>
+        )}
 
         <Modal
           title="Local DB Status"
