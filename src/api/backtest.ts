@@ -52,6 +52,38 @@ const getSpyCloseFromJanFebArray = (
   return LOCAL_SPY_CLOSING_BY_DATE.get(date);
 };
 
+const normalizeFlatStockCache = (parsed: Record<string, unknown>): MasterStockData => {
+  const normalized: MasterStockData = {};
+
+  for (const [key, value] of Object.entries(parsed)) {
+    if (key.includes("|")) {
+      normalized[key] = value as CachedStockResponse;
+      continue;
+    }
+
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+
+    for (const [dateKey, entryValue] of Object.entries(value as Record<string, unknown>)) {
+      if (!entryValue || typeof entryValue !== "object" || Array.isArray(entryValue)) {
+        continue;
+      }
+
+      const entry = entryValue as Partial<CachedStockResponse>;
+      normalized[`${key}|${dateKey}`] = {
+        symbol: entry.symbol ?? key,
+        date: entry.date ?? dateKey,
+        openPrice: entry.openPrice ?? null,
+        closePrice: entry.closePrice ?? null,
+        statusCode: entry.statusCode ?? null,
+      };
+    }
+  }
+
+  return normalized;
+};
+
 const parseMasterStockData = (raw: string | null): MasterStockData | null => {
   if (!raw) {
     return null;
@@ -62,7 +94,8 @@ const parseMasterStockData = (raw: string | null): MasterStockData | null => {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return null;
     }
-    return parsed as MasterStockData;
+
+    return normalizeFlatStockCache(parsed as Record<string, unknown>);
   } catch {
     return null;
   }

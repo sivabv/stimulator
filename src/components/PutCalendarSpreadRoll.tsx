@@ -166,23 +166,54 @@ interface AutoSavedOptionCheckpoint {
   savedAt: string;
 }
 
-type MasterStockData = Record<string, CachedStockPrice>;
+interface PutCalendarSimulationSummary {
+  startDate: string;
+  endDate: string;
+  stockStartPrice: number;
+  stockEndPrice: number | null;
+  optionInvestment: number | null;
+  stockReturn: number | null;
+  stockReturnPct: number | null;
+  optionStrategyReturn: number;
+  optionStrategyReturnPct: number | null;
+}
 
-const RATE_LIMIT_WAIT_MS = 2_000;
+interface PutCalendarBatchResult {
+  key: string;
+  startDate: string;
+  endDate: string | null;
+  stockReturn: number | null;
+  stockReturnPct: number | null;
+  optionStrategyReturn: number | null;
+  optionStrategyReturnPct: number | null;
+  error: string | null;
+}
+
+type MasterStockData = Record<string, CachedStockPrice>;
+type OptionCacheEntry = {
+  data: OptionOpenClose;
+  fetchedAt: string;
+};
+type OptionCacheData = Record<string, OptionCacheEntry>;
+
+const RATE_LIMIT_WAIT_MS = 65_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const MASTER_STOCK_DATA_KEY = "masterStockData";
+const OPTION_CACHE_STORAGE_KEY = "putCalendarOptionCache";
+const OPTION_CACHE_MAX_ENTRIES = 2000;
+const OPTION_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const PUT_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY = "putCalendarSpreadRollAutoSavedCheckpoint";
 const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
 const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
-const LONG_EXPIRY_MIN_DTE_DAYS = 150;
-const LONG_EXPIRY_MAX_DTE_DAYS = 400;
+const LONG_EXPIRY_MIN_DTE_DAYS = 15;
+const LONG_EXPIRY_MAX_DTE_DAYS = 45;
 const MIN_AUTO_ROLL_CREDIT = 0.2;
 const AUTO_ROLL_POPUP_MIN_NET_CREDIT_DEBIT = -10;
 const AUTO_ROLL_POPUP_MAX_NET_CREDIT_DEBIT = 10;
 const AUTO_ROLL_POPUP_WINDOW_WEEKS = 6;
 const AUTO_ROLL_MAX_STRIKE_STEPS = 8;
 const MAX_SIMULATION_TRADING_DAYS = 50;
-const OPTION_STRATEGY_PROFIT_TARGET_PCT = 25;
+const OPTION_STRATEGY_PROFIT_TARGET_PCT = 10;
 const DAILY_PROCESSING_DTE_THRESHOLD_DAYS = 7;
 const GOOGLE_SHEETS_URL =
   import.meta.env.VITE_GOOGLE_SHEETS_URL?.trim() ||
@@ -425,6 +456,46 @@ const saveMasterStockData = (data: MasterStockData) => {
   localStorage.setItem(MASTER_STOCK_DATA_KEY, JSON.stringify(data));
 };
 
+const loadOptionCache = (): OptionCacheData => {
+  try {
+    const raw = localStorage.getItem(OPTION_CACHE_STORAGE_KEY);
+    if (!raw) return {};
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+
+    const normalized: OptionCacheData = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+
+      const entry = value as Partial<OptionCacheEntry>;
+      if (!entry.data || typeof entry.data !== "object") {
+        continue;
+      }
+
+      normalized[key] = {
+        data: entry.data as OptionOpenClose,
+        fetchedAt: typeof entry.fetchedAt === "string" ? entry.fetchedAt : new Date().toISOString(),
+      };
+    }
+
+    return normalized;
+  } catch {
+    return {};
+  }
+};
+
+const saveOptionCache = (data: OptionCacheData) => {
+  const entries = Object.entries(data).sort(
+    ([, a], [, b]) => new Date(b.fetchedAt).valueOf() - new Date(a.fetchedAt).valueOf()
+  );
+
+  const trimmed = Object.fromEntries(entries.slice(0, OPTION_CACHE_MAX_ENTRIES));
+  localStorage.setItem(OPTION_CACHE_STORAGE_KEY, JSON.stringify(trimmed));
+};
+
 const loadAutoSavedCheckpoint = (): AutoSavedOptionCheckpoint | null => {
   try {
     const raw = localStorage.getItem(PUT_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY);
@@ -465,7 +536,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       ? routeParams.firstExpiryDate
       : enableSecondShortPut
         ? initialFirstTradingDate
-        : "2026-01-30"
+        : getFridayWeeksAfter(initialFirstTradingDate, 4)
   );
   const [preferredSecondShortExpiryDate, setPreferredSecondShortExpiryDate] = useState(
     routeTargetsThisSimulator && routeParams.sellExpiryDate
@@ -478,7 +549,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
     if (routeTargetsThisSimulator && routeParams.longExpiryDate) {
       return routeParams.longExpiryDate;
     }
-    if (!enableSecondShortPut) return "2026-12-18";
+    if (!enableSecondShortPut) return getFridayWeeksAfter(initialFirstTradingDate, 8);
     return initialNextTradingDate ? (getNextTradingDate(initialNextTradingDate) ?? "") : "";
   });
   const [firstPutStrike, setFirstPutStrike] = useState<number | null>(
@@ -493,7 +564,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
   const [stockTicker, setStockTicker] = useState(
     routeTargetsThisSimulator && routeParams.ticker
       ? routeParams.ticker.trim().toUpperCase()
-      : "MSFT"
+      : "SPY"
   );
   const [useFivePercentLowerStrike, setUseFivePercentLowerStrike] = useState(
     routeTargetsThisSimulator && routeParams.useFivePercentLowerStrike
@@ -534,21 +605,16 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
   });
   const [guideModalOpen, setGuideModalOpen] = useState(false);
 
-  const [summary, setSummary] = useState<{
-    startDate: string;
-    endDate: string;
-    stockStartPrice: number;
-    stockEndPrice: number | null;
-    optionInvestment: number | null;
-    stockReturn: number | null;
-    stockReturnPct: number | null;
-    optionStrategyReturn: number;
-    optionStrategyReturnPct: number | null;
-  } | null>(null);
+  const [summary, setSummary] = useState<PutCalendarSimulationSummary | null>(null);
+
+  const [batchStartDatesText, setBatchStartDatesText] = useState("");
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number } | null>(null);
+  const [batchResults, setBatchResults] = useState<PutCalendarBatchResult[]>([]);
 
   const stockCacheRef = useRef<MasterStockData>(loadMasterStockData());
   const stockInFlightRef = useRef<Map<string, Promise<CachedStockPrice>>>(new Map());
-  const optionCacheRef = useRef<Record<string, OptionOpenClose>>({});
+  const optionCacheRef = useRef<OptionCacheData>(loadOptionCache());
   const optionInFlightRef = useRef<Map<string, Promise<OptionOpenClose>>>(new Map());
   const routeAutoRunStartedRef = useRef(false);
   const routeSourceUrlRef = useRef(window.location.href);
@@ -560,7 +626,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
     let attempts = 0;
     while (response.statusCode === 429 && attempts < MAX_RATE_LIMIT_RETRIES) {
       attempts += 1;
-      message.warning(`Rate limit hit (429). Waiting 2 seconds before retry ${attempts}.`);
+      message.warning(`Rate limit hit (429). Waiting 65 seconds before retry ${attempts}.`);
       await sleep(RATE_LIMIT_WAIT_MS);
       response = await work();
     }
@@ -592,6 +658,34 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
     }
   };
 
+  const fetchStockPriceInDateWindow = async (
+    symbol: string,
+    targetDate: string,
+    windowDays: number
+  ): Promise<number | null> => {
+    const targetDay = dayjs(targetDate);
+    const candidates = tradingDates.filter((date) => {
+      const diffDays = Math.abs(dayjs(date).diff(targetDay, "day"));
+      return diffDays <= windowDays;
+    });
+
+    const prices = (
+      await Promise.all(
+        candidates.map(async (date) => {
+          const stockData = await fetchStockWithCache(symbol, date);
+          return stockData.closePrice;
+        })
+      )
+    ).filter((value): value is number => value !== null && Number.isFinite(value));
+
+    if (prices.length === 0) {
+      return null;
+    }
+
+    const sorted = [...prices].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  };
+
   const fetchOptionWithCache = async (
     symbol: string,
     expiryDate: string,
@@ -601,7 +695,11 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
   ): Promise<OptionOpenClose> => {
     const cacheKey = getOptionCacheKey(symbol, expiryDate, strikePrice, optionType, date);
     const cached = optionCacheRef.current[cacheKey];
-    if (cached) return cached;
+    const cacheAgeMs = cached ? Date.now() - new Date(cached.fetchedAt).getTime() : Number.POSITIVE_INFINITY;
+
+    if (cached && cacheAgeMs < OPTION_CACHE_TTL_MS) {
+      return cached.data;
+    }
 
     const pending = optionInFlightRef.current.get(cacheKey);
     if (pending) return pending;
@@ -610,7 +708,12 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       const data = await fetchWithRateLimitRetry(() =>
         fetchOptionOpenClose(symbol, expiryDate, strikePrice, optionType, date)
       );
-      optionCacheRef.current[cacheKey] = data;
+
+      optionCacheRef.current[cacheKey] = {
+        data,
+        fetchedAt: new Date().toISOString(),
+      };
+      saveOptionCache(optionCacheRef.current);
       return data;
     })();
 
@@ -888,8 +991,17 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
 
   const runSimulation = async (
     activeManualRolls: ManualRollInstruction[],
-    publishRouteResult = false
-  ) => {
+    publishRouteResult = false,
+    overrideStartDate?: string,
+    overrideShortExpiryDate?: string,
+    overrideSecondShortExpiryDate?: string,
+    overrideLongExpiryDate?: string
+  ): Promise<{ summary: PutCalendarSimulationSummary | null; error: string | null }> => {
+    const effectiveStartDate = overrideStartDate ?? startDate;
+    const effectiveShortExpiryDate = overrideShortExpiryDate ?? preferredShortExpiryDate;
+    const effectiveSecondShortExpiryDate = overrideSecondShortExpiryDate ?? preferredSecondShortExpiryDate;
+    const effectiveLongExpiryDate = overrideLongExpiryDate ?? preferredLongExpiryDate;
+
     setError(null);
     setSummary(null);
     setLoading(true);
@@ -898,27 +1010,28 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
     try {
       const symbol = stockTicker.trim().toUpperCase();
       if (!symbol) throw new Error("Stock ticker is required");
-      if (!dayjs(startDate).isValid()) throw new Error("Start date is invalid");
-      if (preferredShortExpiryDate && !dayjs(preferredShortExpiryDate).isValid()) {
+      if (!dayjs(effectiveStartDate).isValid()) throw new Error("Start date is invalid");
+      if (effectiveShortExpiryDate && !dayjs(effectiveShortExpiryDate).isValid()) {
         throw new Error("Short expiry date is invalid");
       }
       if (
         enableSecondShortPut &&
-        (!preferredSecondShortExpiryDate || !dayjs(preferredSecondShortExpiryDate).isValid())
+        (!effectiveSecondShortExpiryDate || !dayjs(effectiveSecondShortExpiryDate).isValid())
       ) {
         throw new Error("Second short expiry date is invalid");
       }
-      if (preferredLongExpiryDate && !dayjs(preferredLongExpiryDate).isValid()) {
+      if (effectiveLongExpiryDate && !dayjs(effectiveLongExpiryDate).isValid()) {
         throw new Error("Long expiry date is invalid");
       }
 
-      const firstDate = getFirstFridayTradingDateOnOrAfter(startDate);
+      const firstDate = getFirstFridayTradingDateOnOrAfter(effectiveStartDate);
       if (!firstDate) throw new Error("No Friday trading date found on or after the start date");
 
-      const openingStockResult = await fetchStockWithCache(symbol, firstDate);
-      const openingClosePrice = openingStockResult.closePrice;
+      const openingClosePrice =
+        (await fetchStockPriceInDateWindow(symbol, firstDate, 5)) ??
+        (await fetchStockWithCache(symbol, firstDate)).closePrice;
       if (openingClosePrice === null) {
-        throw new Error(`No stock close price found for ${symbol} on ${firstDate}`);
+        throw new Error(`No stock close price found for ${symbol} around ${firstDate} in the +/- 5 day window`);
       }
       const openingStrike = roundToNearestFive(
         openingClosePrice * (useFivePercentLowerStrike ? 0.95 : 1)
@@ -949,6 +1062,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       };
 
       const resolveExpiryDate = async (
+        baseDate: string,
         preferredExpiryDate: string,
         minDteDays: number,
         maxDteDays: number,
@@ -956,16 +1070,39 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
         strike: number
       ): Promise<string> => {
         if (preferredExpiryDate) {
-          const preferredHasData = await hasPutData(preferredExpiryDate, strike);
-          if (!preferredHasData) {
+          const preferredDteDays = dayjs(preferredExpiryDate).diff(dayjs(baseDate), "day");
+          if (preferredDteDays < minDteDays || preferredDteDays > maxDteDays) {
             throw new Error(
-              `${label === "short" ? "Short" : "Long"} expiry has no put option data for ${symbol} on ${firstDate} at strike ${strike}`
+              `${label === "short" ? "Short" : "Long"} expiry must be ${minDteDays}-${maxDteDays} DTE from ${baseDate}`
             );
           }
-          return preferredExpiryDate;
+
+          const maxWindowDate = dayjs(baseDate).add(maxDteDays, "day");
+          let candidateDate = dayjs(preferredExpiryDate);
+
+          while (
+            candidateDate.isAfter(dayjs(baseDate), "day") ||
+            candidateDate.isSame(dayjs(baseDate), "day")
+          ) {
+            const formattedCandidateDate = candidateDate.format("YYYY-MM-DD");
+            const preferredHasData = await hasPutData(formattedCandidateDate, strike);
+            if (preferredHasData) {
+              return formattedCandidateDate;
+            }
+
+            const nextWeekDate = candidateDate.add(7, "day");
+            if (nextWeekDate.isAfter(maxWindowDate, "day") || nextWeekDate.isSame(maxWindowDate, "day")) {
+              break;
+            }
+            candidateDate = nextWeekDate;
+          }
+
+          throw new Error(
+            `${label === "short" ? "Short" : "Long"} expiry has no put option data for ${symbol} on ${preferredExpiryDate} at strike ${strike}`
+          );
         }
 
-        const candidates = getExpiryDateCandidatesInDteWindow(firstDate, minDteDays, maxDteDays);
+        const candidates = getExpiryDateCandidatesInDteWindow(baseDate, minDteDays, maxDteDays);
         for (const candidate of candidates) {
           if (await hasPutData(candidate, strike)) {
             return candidate;
@@ -978,21 +1115,23 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       };
 
       const initialShortExpiryDate = await resolveExpiryDate(
-        preferredShortExpiryDate,
+        firstDate,
+        effectiveShortExpiryDate,
         SHORT_EXPIRY_MIN_DTE_DAYS,
         SHORT_EXPIRY_MAX_DTE_DAYS,
         "short",
         openingFirstPutStrike
       );
       const longExpiryDate = await resolveExpiryDate(
-        preferredLongExpiryDate,
+        initialShortExpiryDate,
+        effectiveLongExpiryDate,
         LONG_EXPIRY_MIN_DTE_DAYS,
         LONG_EXPIRY_MAX_DTE_DAYS,
         "long",
         openingLongPutStrike
       );
       const secondShortExpiryDate = enableSecondShortPut
-        ? preferredSecondShortExpiryDate
+        ? effectiveSecondShortExpiryDate
         : null;
 
       if (secondShortExpiryDate) {
@@ -1329,7 +1468,9 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       };
       setSummary(simulationSummary);
 
-      if (publishRouteResult) {
+      const shouldAutoPublish = publishRouteResult || Boolean(autoRollStoppedReason);
+
+      if (shouldAutoPublish) {
         if (!isSimulationResultsApiConfigured()) {
           message.warning("Simulation completed, but the Google Sheets results API is not configured.");
         } else {
@@ -1338,7 +1479,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
               recordedAt: new Date().toISOString(),
               strategy: enableSecondShortPut ? "3 Tier" : "Put Calendar Spread Roll",
               ticker: symbol,
-              requestedStartDate: startDate,
+              requestedStartDate: effectiveStartDate,
               actualStartDate: firstDate,
               endDate: actualEndDate,
               shortExpiryDate: initialShortExpiryDate,
@@ -1362,6 +1503,28 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
               inputParams: Object.fromEntries(
                 new URL(routeSourceUrlRef.current).searchParams.entries()
               ),
+              gridData: {
+                rows: allRows.map((row) => ({
+                  date: row.date,
+                  closingPrice: row.closingPrice,
+                  strike: row.strike,
+                  secondShortStrike: row.secondShortStrike,
+                  longStrike: row.longStrike,
+                  shortExpiryDate: row.shortExpiryDate,
+                  secondShortExpiryDate: row.secondShortExpiryDate,
+                  longExpiryDate: row.longExpiryDate,
+                  dte: dayjs(row.shortExpiryDate).diff(dayjs(row.date), "day"),
+                  shortPutPrice: row.shortPutPrice,
+                  secondShortPutPrice: row.secondShortPutPrice,
+                  longPutPrice: row.longPutPrice,
+                  stockReturn: row.stockReturn,
+                  stockReturnPct: row.stockReturnPct,
+                  cumulativePnl: row.cumulativePnl,
+                  cumulativeReturnPct: row.cumulativeReturnPct,
+                  status: row.status,
+                  rollNumber: row.rollNumber,
+                })),
+              },
               resultSummary: simulationSummary,
             });
             message.success("Simulation result sent to Google Sheets.");
@@ -1373,8 +1536,12 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
           }
         }
       }
+
+      return { summary: simulationSummary, error: null };
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to run put calendar spread simulation");
+      const errorMessage = err instanceof Error ? err.message : "Failed to run put calendar spread simulation";
+      setError(errorMessage);
+      return { summary: null, error: errorMessage };
     } finally {
       setLoading(false);
     }
@@ -1387,6 +1554,67 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
 
   const handlePublish = async () => {
     await runSimulation(manualRolls, true);
+  };
+
+  const parseBatchStartDates = (raw: string): string[] => {
+    const candidates = raw
+      .split(/[\n,]+/)
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && dayjs(value).isValid())
+      .map((value) => dayjs(value).format("YYYY-MM-DD"));
+    return Array.from(new Set(candidates)).sort((a, b) => dayjs(a).valueOf() - dayjs(b).valueOf());
+  };
+
+  const runBatch = async () => {
+    const dates = parseBatchStartDates(batchStartDatesText);
+    if (dates.length === 0) {
+      message.warning("Enter at least one valid start date to run sequentially");
+      return;
+    }
+
+    setBatchRunning(true);
+    setBatchResults([]);
+    setBatchProgress({ current: 0, total: dates.length });
+
+    for (let i = 0; i < dates.length; i += 1) {
+      const date = dates[i];
+      try {
+        // fresh manual rolls + auto-calculated expiries per date, run one at a time
+        const result = await runSimulation([], true, date, "", "", "");
+        setBatchResults((previous) => [
+          ...previous,
+          {
+            key: date,
+            startDate: date,
+            endDate: result.summary?.endDate ?? null,
+            stockReturn: result.summary?.stockReturn ?? null,
+            stockReturnPct: result.summary?.stockReturnPct ?? null,
+            optionStrategyReturn: result.summary?.optionStrategyReturn ?? null,
+            optionStrategyReturnPct: result.summary?.optionStrategyReturnPct ?? null,
+            error: result.error,
+          },
+        ]);
+      } catch (err) {
+        setBatchResults((previous) => [
+          ...previous,
+          {
+            key: date,
+            startDate: date,
+            endDate: null,
+            stockReturn: null,
+            stockReturnPct: null,
+            optionStrategyReturn: null,
+            optionStrategyReturnPct: null,
+            error: err instanceof Error ? err.message : "Unknown batch run error",
+          },
+        ]);
+      } finally {
+        setBatchProgress({ current: i + 1, total: dates.length });
+      }
+    }
+
+    setBatchRunning(false);
+    message.success(`Batch run complete: ${dates.length} simulation(s) processed`);
   };
 
   useEffect(() => {
@@ -1465,6 +1693,8 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       [dataKey]: !previous[dataKey],
     }));
   };
+
+  const shouldShowGrid = showGrid || rows.length > 0;
 
   return (
     <Space direction="vertical" size={20} style={{ width: "100%" }}>
@@ -1563,7 +1793,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
                   : false)
               }
               style={{ width: "100%", marginTop: 8 }}
-              placeholder="Auto 150-400 DTE"
+              placeholder="Auto 15-45 days after short expiry"
             />
             {enableSecondShortPut && (
               <InputNumber<number>
@@ -1582,7 +1812,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
               value={stockTicker}
               onChange={(e) => setStockTicker(e.target.value.toUpperCase())}
               style={{ marginTop: 8 }}
-              placeholder="MSFT"
+              placeholder="SPY"
             />
           </Col>
         </Row>
@@ -1631,6 +1861,31 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
             {showGrid ? "Hide Grid" : "Show Grid"}
           </Button>
         </Space>
+        <Space direction="vertical" size={8} style={{ width: "100%", marginTop: 16 }}>
+          <Text strong>Batch Run (Sequential)</Text>
+          <Input.TextArea
+            value={batchStartDatesText}
+            onChange={(e) => setBatchStartDatesText(e.target.value)}
+            placeholder={"One start date per line, e.g.\n2025-01-03\n2025-01-10"}
+            autoSize={{ minRows: 3, maxRows: 6 }}
+            disabled={batchRunning}
+          />
+          <Space wrap>
+            <Button
+              icon={<PlayCircleOutlined />}
+              onClick={() => void runBatch()}
+              loading={batchRunning}
+              disabled={loading}
+            >
+              Run Sequentially
+            </Button>
+            {batchProgress && (
+              <Text type="secondary">
+                Batch progress: {batchProgress.current}/{batchProgress.total}
+              </Text>
+            )}
+          </Space>
+        </Space>
         <Text type="secondary" style={{ display: "block", marginTop: 8 }}>
           Processed simulations: {processedSimulationCount}
         </Text>
@@ -1640,6 +1895,61 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       </Card>
 
       {error && <Alert type="error" showIcon message="Put Calendar Spread Error" description={error} />}
+
+      {batchResults.length > 0 && (
+        <Card title="Batch Results">
+          <Table<PutCalendarBatchResult>
+            rowKey="key"
+            dataSource={batchResults}
+            pagination={{ pageSize: 20 }}
+            scroll={{ x: 760 }}
+            columns={[
+              { title: "Start Date", dataIndex: "startDate", key: "startDate", width: 110 },
+              {
+                title: "End Date",
+                dataIndex: "endDate",
+                key: "endDate",
+                width: 110,
+                render: (v: string | null) => v ?? "-",
+              },
+              {
+                title: "Stock Return ($ | %)",
+                key: "stockReturn",
+                width: 170,
+                render: (_: unknown, row: PutCalendarBatchResult) => (
+                  <Space size={2}>
+                    <Text>{formatCurrency(row.stockReturn)}</Text>
+                    <Text>|</Text>
+                    <Text>{formatPercent(row.stockReturnPct)}</Text>
+                  </Space>
+                ),
+              },
+              {
+                title: "Option Strategy Return ($ | %)",
+                key: "optionStrategyReturn",
+                width: 200,
+                render: (_: unknown, row: PutCalendarBatchResult) => (
+                  <Space size={2}>
+                    <Text style={{ color: (row.optionStrategyReturn ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                      {formatCurrency(row.optionStrategyReturn)}
+                    </Text>
+                    <Text>|</Text>
+                    <Text style={{ color: (row.optionStrategyReturnPct ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}>
+                      {formatPercent(row.optionStrategyReturnPct)}
+                    </Text>
+                  </Space>
+                ),
+              },
+              {
+                title: "Status",
+                key: "status",
+                render: (_: unknown, row: PutCalendarBatchResult) =>
+                  row.error ? <Tag color="red">{row.error}</Tag> : <Tag color="green">Success</Tag>,
+              },
+            ]}
+          />
+        </Card>
+      )}
 
       {summary && showSummary && (
         <Card title="Summary">
@@ -1799,7 +2109,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
         </Card>
       )}
 
-      {showGrid && (
+      {shouldShowGrid && (
         <Card title="Records">
           <style>
             {`
@@ -2434,8 +2744,8 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
               <ul style={{ marginTop: 8, marginBottom: 0 }}>
                 <li><Text>Start Date: first simulation date (aligned to next trading date if needed).</Text></li>
                 <li><Text>Short Expiry Date (optional): blank uses auto 15-75 DTE selection.</Text></li>
-                <li><Text>Long Expiry Date (optional): blank uses auto 150-400 DTE selection.</Text></li>
-                <li><Text>Stock ticker: underlying symbol (default MSFT, placeholder SPY).</Text></li>
+                <li><Text>Long Expiry Date (optional): blank uses auto 15-45 days after the short expiry.</Text></li>
+                <li><Text>Stock ticker: underlying symbol (default SPY, placeholder SPY).</Text></li>
               </ul>
             </div>
 
@@ -2471,7 +2781,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
               <Text strong>Common Prompts and Warnings</Text>
               <ul style={{ marginTop: 8, marginBottom: 0 }}>
                 <li><Text>Validation: invalid dates, missing ticker, invalid strike, missing next trading date.</Text></li>
-                <li><Text>Rate limits: 429 warning retries with 2-second waits.</Text></li>
+                <li><Text>Rate limits: 429 warning retries with 65-second waits.</Text></li>
                 <li><Text>Auto-roll stop warnings when no valid credit target or no next trading date exists.</Text></li>
               </ul>
             </div>

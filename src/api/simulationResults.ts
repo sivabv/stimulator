@@ -24,6 +24,9 @@ export interface PutCalendarSimulationResult {
   stopReason: string | null;
   sourceUrl: string;
   inputParams: Record<string, string>;
+  gridData: {
+    rows: Array<Record<string, string | number | null>>;
+  };
   resultSummary: {
     startDate: string;
     endDate: string;
@@ -57,4 +60,29 @@ export async function appendPutCalendarSimulationResult(
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify(result),
   });
+}
+
+export async function fetchPutCalendarSimulationResults(): Promise<
+  PutCalendarSimulationResult[]
+> {
+  if (!RESULTS_API_URL) {
+    throw new Error("VITE_GOOGLE_SHEETS_WEB_APP_URL is not configured");
+  }
+
+  const response = await fetch(`${RESULTS_API_URL}?action=list`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch simulation results (status ${response.status})`);
+  }
+
+  const payload = await response.json();
+  if (!payload || payload.ok !== true || !Array.isArray(payload.results)) {
+    if (payload && payload.ok === true && !("results" in payload)) {
+      throw new Error(
+        "The deployed Apps Script web app is missing the \"action=list\" handler. Redeploy Code.gs as a new version."
+      );
+    }
+    throw new Error(payload?.error || "Unexpected response from simulation results API");
+  }
+
+  return payload.results as PutCalendarSimulationResult[];
 }

@@ -4,6 +4,10 @@
 It accepts JSON simulation summaries through `POST` and appends them to the `Simulation Results`
 sheet, creating that sheet and its header row when necessary.
 
+`GET ?action=list` returns `{ ok: true, results: [...] }` with every row from the sheet, parsing
+the `inputParams`, `gridData`, and `resultSummary` JSON columns back into objects. The React
+client's "Simulation Results" tab uses this endpoint to render the recorded runs in a table.
+
 The React client uses the deployed URL in `src/api/simulationResults.ts`. Override it for another
 spreadsheet or deployment with:
 

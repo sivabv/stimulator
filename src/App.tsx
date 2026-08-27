@@ -32,6 +32,8 @@ const ChartsAndLink = lazy(() => import("./components/ChartsAndLink"));
 const ChartsAndLinkV2 = lazy(() => import("./components/ChartsAndLinkV2"));
 const FutureChart = lazy(() => import("./components/FutureChart"));
 const ThreeTier = lazy(() => import("./components/ThreeTier"));
+const SimulationCalendar = lazy(() => import("./components/SimulationCalendar"));
+const SimulationResultsGrid = lazy(() => import("./components/SimulationResultsGrid"));
 
 const PAGE_NOT_FOUND_KEY = "page-not-found";
 const VALID_TABS = new Set([
@@ -44,6 +46,8 @@ const VALID_TABS = new Set([
   "weekly-straddle-roll",
   "straddle-rolling",
   "put-calendar-spread-roll",
+  "simulation-calendar",
+  "simulation-results",
   "call-calendar-spread-roll",
   "calendar-spread-roll-split",
   "local-full-screen-charts",
@@ -117,6 +121,41 @@ const App: React.FC = () => {
   } | null>(null);
 
   /** Export a full local snapshot as JSON, including SQLite-backed data */
+  const combineTickerStockData = (data: Record<string, unknown>): Record<string, Record<string, unknown>> => {
+    const grouped: Record<string, Record<string, unknown>> = {};
+
+    for (const [key, value] of Object.entries(data)) {
+      if (!value || typeof value !== "object" || Array.isArray(value) || !key.includes("|")) {
+        continue;
+      }
+
+      const [symbol, date] = key.split("|");
+      if (!symbol || !date) {
+        continue;
+      }
+
+      if (!grouped[symbol]) {
+        grouped[symbol] = {};
+      }
+
+      grouped[symbol][date] = value;
+    }
+
+    return grouped;
+  };
+
+  const normalizeExportSnapshot = (snapshot: Record<string, unknown>): Record<string, unknown> => {
+    const normalized: Record<string, unknown> = { ...snapshot };
+
+    if (normalized.masterStockData && typeof normalized.masterStockData === "object") {
+      normalized.masterStockData = combineTickerStockData(
+        normalized.masterStockData as Record<string, unknown>
+      );
+    }
+
+    return normalized;
+  };
+
   const handleDownloadLocalStorage = async () => {
     const storageSnapshot: Record<string, unknown> = {};
     const sqliteSnapshot: Record<string, unknown> = {};
@@ -152,8 +191,8 @@ const App: React.FC = () => {
       exportedAt: new Date().toISOString(),
       source: "browser-local-data",
       data: {
-        localStorage: storageSnapshot,
-        sqlite: sqliteSnapshot,
+        localStorage: normalizeExportSnapshot(storageSnapshot),
+        sqlite: normalizeExportSnapshot(sqliteSnapshot),
       },
     };
 
@@ -265,6 +304,42 @@ const App: React.FC = () => {
               syncTabState(tabKey);
             }}
             items={[
+                {
+                key: "interest-calculator",
+                label: "Interest Calculator",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <InterestCalculator />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "put-calendar-spread-roll",
+                label: "Put Calendar Spread Roll",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <PutCalendarSpreadRoll />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "simulation-calendar",
+                label: "Simulation Calendar",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <SimulationCalendar />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "simulation-results",
+                label: "Simulation Results",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <SimulationResultsGrid />
+                  </Suspense>
+                ),
+              },
               {
                 key: "trade-links",
                 label: "Trade",
@@ -348,15 +423,7 @@ const App: React.FC = () => {
                   </Suspense>
                 ),
               },
-              {
-                key: "interest-calculator",
-                label: "Interest Calculator",
-                children: (
-                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
-                    <InterestCalculator />
-                  </Suspense>
-                ),
-              },
+            
               {
                 key: "weekly-straddle-roll",
                 label: "Weekly Straddle Roll",
@@ -395,15 +462,7 @@ const App: React.FC = () => {
                   </Suspense>
                 ),
               },
-              {
-                key: "put-calendar-spread-roll",
-                label: "Put Calendar Spread Roll",
-                children: (
-                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
-                    <PutCalendarSpreadRoll />
-                  </Suspense>
-                ),
-              },
+              
               {
                 key: "call-calendar-spread-roll",
                 label: "Call Calendar Spread Roll",

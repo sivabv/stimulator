@@ -26,11 +26,55 @@ const RESULT_COLUMNS = [
   ["Stop Reason", "stopReason"],
   ["Source URL", "sourceUrl"],
   ["Input Params", "inputParams"],
+  ["Grid Data", "gridData"],
   ["Result Summary", "resultSummary"],
 ];
 
-function doGet() {
+function doGet(event) {
+  const action = event && event.parameter ? event.parameter.action : null;
+  if (action === "list") {
+    return jsonResponse(listResults());
+  }
   return jsonResponse({ ok: true, sheet: RESULTS_SHEET_NAME });
+}
+
+function listResults() {
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = spreadsheet.getSheetByName(RESULTS_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return { ok: true, results: [] };
+  }
+
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const rows = sheet.getRange(2, 1, lastRow - 1, lastColumn).getValues();
+
+  const keyByHeader = {};
+  RESULT_COLUMNS.forEach(([header, key]) => {
+    keyByHeader[header] = key;
+  });
+  const jsonKeys = new Set(["inputParams", "gridData", "resultSummary"]);
+
+  const results = rows.map((row) => {
+    const record = {};
+    headers.forEach((header, index) => {
+      const key = keyByHeader[header] || header;
+      const value = row[index];
+      if (jsonKeys.has(key) && typeof value === "string" && value) {
+        try {
+          record[key] = JSON.parse(value);
+        } catch (error) {
+          record[key] = value;
+        }
+      } else {
+        record[key] = value;
+      }
+    });
+    return record;
+  });
+
+  return { ok: true, results };
 }
 
 function doPost(event) {

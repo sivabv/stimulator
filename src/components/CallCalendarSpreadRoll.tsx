@@ -98,7 +98,7 @@ interface AutoSavedOptionCheckpoint {
 
 type MasterStockData = Record<string, CachedStockPrice>;
 
-const RATE_LIMIT_WAIT_MS = 2_000;
+const RATE_LIMIT_WAIT_MS = 65_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const MASTER_STOCK_DATA_KEY = "masterStockData";
 const CALL_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY = "callCalendarSpreadRollAutoSavedCheckpoint";
@@ -390,7 +390,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
     let attempts = 0;
     while (response.statusCode === 429 && attempts < MAX_RATE_LIMIT_RETRIES) {
       attempts += 1;
-      message.warning(`Rate limit hit (429). Waiting 2 seconds before retry ${attempts}.`);
+      message.warning(`Rate limit hit (429). Waiting 65 seconds before retry ${attempts}.`);
       await sleep(RATE_LIMIT_WAIT_MS);
       response = await work();
     }

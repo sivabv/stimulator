@@ -18,6 +18,7 @@ import {
 import { PlayCircleOutlined, AimOutlined, InfoCircleOutlined } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { fetchOptionOpenClose, fetchStockOpenClose } from "../api/backtest";
+import spyClosingData from "../assets/spy-closing.json";
 import tradingDatesJson from "../assets/trading_dates_2026.json";
 
 const { Paragraph, Text, Title } = Typography;
@@ -56,8 +57,29 @@ const MAX_RATE_LIMIT_RETRIES = 3;
 const INTEREST_CALCULATOR_SNAPSHOT_KEY = "interestCalculatorSavedSimulation";
 const INTEREST_CALCULATOR_SAVED_SIMULATIONS_KEY = "interestCalculatorSavedSimulations";
 const tradingDates = tradingDatesJson as string[];
+const spyClosingByDate = new Map(
+	(spyClosingData as Array<{ date: string; close: number | null }>).map((point) => [point.date, point.close])
+);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const getFirstFridayOfMonth = (year: number, monthIndex: number) => {
+	const monthStart = dayjs(`${year}-${String(monthIndex + 1).padStart(2, "0")}-01`);
+	const monthEnd = monthStart.endOf("month");
+	let cursor = monthStart;
+
+	while (cursor.isBefore(monthEnd, "day") || cursor.isSame(monthEnd, "day")) {
+		if (cursor.day() === 5) {
+			const dateValue = cursor.format("YYYY-MM-DD");
+			if (spyClosingByDate.has(dateValue)) {
+				return cursor;
+			}
+		}
+		cursor = cursor.add(1, "day");
+	}
+
+	return monthStart;
+};
 
 const roundToNearestFive = (value: number): number => Math.round(value / 5) * 5;
 
@@ -249,6 +271,65 @@ const InterestCalculator: React.FC = () => {
 		});
 	}, [startDate]);
 
+	const constructedCalendarDates = useMemo(() => {
+		if (!dayjs(startDate).isValid()) {
+			return [] as Array<{ month: string; date: string; closePrice: number | null }>;
+		}
+
+		const start = dayjs(startDate).startOf("month");
+		const end = dayjs("2026-12-31");
+		const result: Array<{ month: string; date: string; closePrice: number | null }> = [];
+		const seenDates = new Set<string>();
+		let cursor = start;
+
+		while (cursor.isBefore(end, "month") || cursor.isSame(end, "month")) {
+			const monthFirstFriday = getFirstFridayOfMonth(cursor.year(), cursor.month());
+			const isoDate = monthFirstFriday.format("YYYY-MM-DD");
+			const dateIsInRange =
+				(monthFirstFriday.isAfter(dayjs(startDate), "day") ||
+					monthFirstFriday.isSame(dayjs(startDate), "day")) &&
+				(monthFirstFriday.isBefore(end, "day") || monthFirstFriday.isSame(end, "day"));
+
+			if (dateIsInRange && spyClosingByDate.has(isoDate) && !seenDates.has(isoDate)) {
+				seenDates.add(isoDate);
+				result.push({
+					month: monthFirstFriday.format("MMM"),
+					date: monthFirstFriday.format("YYYY-MM-DD"),
+					closePrice: spyClosingByDate.get(isoDate) ?? null,
+				});
+			}
+
+			cursor = cursor.add(1, "month");
+		}
+
+		return result.sort((a, b) => dayjs(a.date).valueOf() - dayjs(b.date).valueOf());
+	}, [startDate]);
+
+	const monthlySimulationOptions = useMemo(() => {
+		const monthStarts = new Map<string, string>();
+
+		for (const date of tradingDates) {
+			const parsed = dayjs(date);
+			if (!parsed.isValid()) continue;
+
+			const monthKey = parsed.format("YYYY-MM");
+			if (!monthStarts.has(monthKey)) {
+				monthStarts.set(monthKey, parsed.format("YYYY-MM-DD"));
+			}
+		}
+
+		return Array.from({ length: 12 }, (_, index) => {
+			const monthKey = `2025-${String(index + 1).padStart(2, "0")}`;
+			const monthDate = monthStarts.get(monthKey) ?? `${monthKey}-01`;
+			const parsed = dayjs(monthDate);
+
+			return {
+				label: parsed.isValid() ? parsed.format("MMM") : dayjs(`${monthKey}-01`).format("MMM"),
+				value: parsed.isValid() ? parsed.format("YYYY-MM-DD") : `${monthKey}-01`,
+			};
+		});
+	}, []);
+
 	const fetchWithRateLimitRetry = async <T extends { statusCode: number | null }>(work: () => Promise<T>) => {
 		let response = await work();
 		let attempts = 0;
@@ -292,14 +373,14 @@ const InterestCalculator: React.FC = () => {
 		return null;
 	};
 
-	const analyzeInterest = async (nextStrikePrice: number): Promise<AnalysisRow[]> => {
+	const analyzeInterest = async (nextStrikePrice: number, nextStartDate: string = startDate): Promise<AnalysisRow[]> => {
 		const normalizedSymbol = symbol.trim().toUpperCase();
 
 		if (!normalizedSymbol) {
 			throw new Error("Symbol is required");
 		}
 
-		if (!dayjs(startDate).isValid()) {
+		if (!dayjs(nextStartDate).isValid()) {
 			throw new Error("Start date must be valid");
 		}
 
@@ -307,21 +388,32 @@ const InterestCalculator: React.FC = () => {
 			throw new Error("Strike price must be a positive number");
 		}
 
-		if (observationDates.length === 0) {
+		const activeObservationDates = tradingDates.filter((date) => {
+			const start = dayjs(nextStartDate);
+			const end = dayjs("2026-12-31");
+			const candidate = dayjs(date);
+			return (
+				candidate.isValid() &&
+				(candidate.isAfter(start, "day") || candidate.isSame(start, "day")) &&
+				(candidate.isBefore(end, "day") || candidate.isSame(end, "day"))
+			);
+		});
+
+		if (activeObservationDates.length === 0) {
 			throw new Error("No trading dates were found between the selected start date and December 2026");
 		}
 
-		const startStockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(normalizedSymbol, startDate));
+		const startStockData = await fetchWithRateLimitRetry(() => fetchStockOpenClose(normalizedSymbol, nextStartDate));
 		const givenDateStockClose = startStockData.closePrice;
 
-		const seededRows: AnalysisRow[] = observationDates.map((rowExpiryDate) => ({
+		const seededRows: AnalysisRow[] = activeObservationDates.map((rowExpiryDate) => ({
 			key: rowExpiryDate,
-			date: startDate,
+			date: nextStartDate,
 			expiryDate: rowExpiryDate,
 			strikePrice: nextStrikePrice,
 			stockClose: givenDateStockClose,
 			optionClose: null,
-			daysToExpiry: dayjs(rowExpiryDate).diff(dayjs(startDate), "day"),
+			daysToExpiry: dayjs(rowExpiryDate).diff(dayjs(nextStartDate), "day"),
 			delta: null,
 			interestPercentage: null,
 			annualInterestRate: null,
@@ -440,16 +532,17 @@ const InterestCalculator: React.FC = () => {
 		}
 	};
 
-	const handleAnalyze = async () => {
+	const handleAnalyze = async (nextStartDate: string = startDate, nextStrikePrice: number | null = strikePrice) => {
 		setError(null);
 		setRows([]);
 		setLoading(true);
+		setStartDate(nextStartDate);
 
 		try {
 			const normalizedSymbol = symbol.trim().toUpperCase();
 			let strikeToUse =
-				typeof strikePrice === "number" && Number.isFinite(strikePrice) && strikePrice > 0
-					? strikePrice
+				typeof nextStrikePrice === "number" && Number.isFinite(nextStrikePrice) && nextStrikePrice > 0
+					? nextStrikePrice
 					: null;
 
 			if (strikeToUse === null) {
@@ -457,13 +550,13 @@ const InterestCalculator: React.FC = () => {
 					throw new Error("Symbol is required");
 				}
 
-				if (!dayjs(startDate).isValid()) {
+				if (!dayjs(nextStartDate).isValid()) {
 					throw new Error("Start date is invalid");
 				}
 
-				const previousClose = await findPreviousClose(normalizedSymbol, startDate);
+				const previousClose = await findPreviousClose(normalizedSymbol, nextStartDate);
 				if (!previousClose) {
-					throw new Error(`No close price found for ${normalizedSymbol} near ${startDate} (previous days and +5 days)`);
+					throw new Error(`No close price found for ${normalizedSymbol} near ${nextStartDate} (previous days and +5 days)`);
 				}
 
 				strikeToUse = roundToNearestFive(previousClose.price);
@@ -471,7 +564,7 @@ const InterestCalculator: React.FC = () => {
 				message.info(`Auto-picked strike ${strikeToUse} from ${normalizedSymbol} previous close ${previousClose.date} = ${previousClose.price.toFixed(2)}.`);
 			}
 
-			const finalRows = await analyzeInterest(strikeToUse);
+			const finalRows = await analyzeInterest(strikeToUse, nextStartDate);
 			handleSaveSimulation(finalRows);
 		} catch (err) {
 			const nextError = err instanceof Error ? err.message : "Failed to analyze interest";
@@ -479,6 +572,43 @@ const InterestCalculator: React.FC = () => {
 		} finally {
 			setLoading(false);
 		}
+	};
+
+	const runMonthlySimulationsSequentially = async () => {
+		if (loading) {
+			return;
+		}
+
+		let effectiveStrike = typeof strikePrice === "number" && Number.isFinite(strikePrice) && strikePrice > 0 ? strikePrice : null;
+		const normalizedSymbol = symbol.trim().toUpperCase();
+
+		if (effectiveStrike === null && normalizedSymbol) {
+			const firstMonthDate = monthlySimulationOptions[0]?.value ?? startDate;
+			const previousClose = await findPreviousClose(normalizedSymbol, firstMonthDate);
+			if (!previousClose) {
+				throw new Error(`No close price found for ${normalizedSymbol} near ${firstMonthDate} (previous days and +5 days)`);
+			}
+			effectiveStrike = roundToNearestFive(previousClose.price);
+			setStrikePrice(effectiveStrike);
+		}
+
+		for (const monthOption of monthlySimulationOptions) {
+			await handleAnalyze(monthOption.value, effectiveStrike);
+		}
+	};
+
+	const handleConstructedDateClick = async (date: string, closePrice: number | null) => {
+		if (!dayjs(date).isValid()) {
+			return;
+		}
+
+		const nextStrike =
+			typeof closePrice === "number" && Number.isFinite(closePrice) && closePrice > 0
+				? roundToNearestFive(closePrice)
+				: strikePrice;
+
+		setStrikePrice(nextStrike ?? null);
+		await handleAnalyze(date, nextStrike ?? null);
 	};
 
 	const readSavedSimulations = (): SavedInterestSimulation[] => {
@@ -634,7 +764,7 @@ const InterestCalculator: React.FC = () => {
 								type="default"
 								style={{ minWidth: 72 }}
 							>
-								{dayjs(startDate).isValid() ? dayjs(startDate).format("MM/DD") : "MM/DD"}
+								{dayjs(startDate).isValid() ? dayjs(startDate).format("MM/DD/YYYY") : "MM/DD/YYYY"}
 							</Button>
 						</Space>
 					</Col>
@@ -713,30 +843,113 @@ const InterestCalculator: React.FC = () => {
 					>
 						Save Simulation
 					</Button>
-					<Button type="primary" icon={<PlayCircleOutlined />} onClick={handleAnalyze} loading={loading}>
+					<Button type="primary" icon={<PlayCircleOutlined />} onClick={() => void handleAnalyze()} loading={loading}>
 						Analyze Interest
 					</Button>
 				</Space>
 
-				{savedSimulations.length > 0 && (
-					<Space style={{ marginTop: 16 }} wrap>
-						{savedSimulations.map((saved, index) => (
+				<div style={{ marginTop: 16 }}>
+					<Text strong>Monthly simulations</Text>
+					<Space wrap style={{ marginTop: 8 }}>
+						<Button
+							type="primary"
+							size="small"
+							onClick={() => {
+								void runMonthlySimulationsSequentially();
+							}}
+							loading={loading}
+						>
+							Run all 12 months
+						</Button>
+						{monthlySimulationOptions.map((monthOption) => (
 							<Button
-								key={`${saved.savedAt}-${index}`}
-								type={saved.startDate === startDate ? "primary" : "default"}
+								key={monthOption.value}
+								type={startDate === monthOption.value ? "primary" : "default"}
+								size="small"
 								onClick={() => {
-									setSymbol(saved.symbol);
-									setStartDate(saved.startDate);
-									setStrikePrice(saved.strikePrice);
-									setOptionType(saved.optionType);
-									setRows(saved.rows);
+									void handleAnalyze(monthOption.value, strikePrice);
 								}}
+								loading={loading && startDate === monthOption.value}
 							>
-								{dayjs(saved.startDate).isValid() ? dayjs(saved.startDate).format("MM/DD") : "MM/DD"}
+								{monthOption.label}
 							</Button>
 						))}
 					</Space>
+				</div>
+
+				{savedSimulations.length > 0 && (
+					<Space style={{ marginTop: 16 }} wrap>
+						{[...savedSimulations]
+							.sort((a, b) => {
+								const aDate = dayjs(a.startDate).isValid() ? dayjs(a.startDate).valueOf() : 0;
+								const bDate = dayjs(b.startDate).isValid() ? dayjs(b.startDate).valueOf() : 0;
+								return bDate - aDate;
+							})
+							.map((saved, index) => {
+								const hasSavedRows = Array.isArray(saved.rows) && saved.rows.length > 0;
+								return (
+									<Button
+										key={`${saved.savedAt}-${index}`}
+										type={saved.startDate === startDate ? "primary" : hasSavedRows ? "primary" : "default"}
+										style={
+											hasSavedRows
+												? {
+														background: "#52c41a",
+														borderColor: "#52c41a",
+														color: "#fff",
+												  }
+												: undefined
+										}
+										onClick={() => {
+											setSymbol(saved.symbol);
+											setStartDate(saved.startDate);
+											setStrikePrice(saved.strikePrice);
+											setOptionType(saved.optionType);
+											setRows(saved.rows);
+										}}
+									>
+										{dayjs(saved.startDate).isValid() ? dayjs(saved.startDate).format("MM/DD/YYYY") : "MM/DD/YYYY"}
+									</Button>
+								);
+							})}
+					</Space>
 				)}
+			</Card>
+
+			<Card title="Constructed dates" style={{ marginTop: 20 }}>
+				<Space direction="vertical" size={12} style={{ width: "100%" }}>
+					<Text type="secondary">
+						{`Generated ${constructedCalendarDates.length} simulation dates from ${dayjs(startDate).isValid() ? dayjs(startDate).format("MM/DD/YYYY") : "selected date"} through 12/31/2026.`}
+					</Text>
+					<Row gutter={[12, 12]}>
+						{constructedCalendarDates.map((item) => (
+							<Col xs={12} sm={8} md={6} lg={4} key={item.date}>
+								<Button
+									block
+									size="large"
+									onClick={() => {
+										void handleConstructedDateClick(item.date, item.closePrice);
+									}}
+									style={{
+										minHeight: 88,
+										display: "flex",
+										flexDirection: "column",
+										alignItems: "center",
+										justifyContent: "center",
+										padding: "8px 12px",
+										whiteSpace: "normal",
+									}}
+								>
+									<span>{item.month}</span>
+									<span style={{ fontSize: 12, marginTop: 4 }}>{dayjs(item.date).format("MM/DD/YYYY")}</span>
+									<span style={{ fontSize: 11, marginTop: 4, color: "#666" }}>
+										{item.closePrice !== null ? `$${item.closePrice.toFixed(2)}` : "No close"}
+									</span>
+								</Button>
+							</Col>
+						))}
+					</Row>
+				</Space>
 			</Card>
 
 			{error && <Alert type="error" showIcon message="Interest Analysis Error" description={error} />}
