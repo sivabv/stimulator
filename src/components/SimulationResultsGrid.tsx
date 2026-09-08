@@ -48,6 +48,12 @@ const getTheta = (row: PutCalendarSimulationResult) => {
   return row.optionStrategyReturn / durationDays;
 };
 
+const getFilterOptions = (values: Array<string | null | undefined>) =>
+  Array.from(new Set(values.filter((value): value is string => Boolean(value)))).map((value) => ({
+    text: value,
+    value,
+  }));
+
 const buildSimulationUrl = (row: PutCalendarSimulationResult): string => {
   const url = new URL(window.location.href);
   const params = new URLSearchParams({
@@ -102,6 +108,12 @@ const SimulationResultsGrid: React.FC = () => {
       void loadResults();
     }
   }, []);
+
+  const strategyFilters = getFilterOptions(results.map((row) => row.strategy));
+  const tickerFilters = getFilterOptions(results.map((row) => row.ticker));
+  const startDateFilters = getFilterOptions(results.map((row) => row.actualStartDate));
+  const endDateFilters = getFilterOptions(results.map((row) => row.endDate));
+  const stopReasonFilters = getFilterOptions(results.map((row) => row.stopReason));
 
   return (
     <Space direction="vertical" size={20} style={{ width: "100%" }}>
@@ -195,6 +207,9 @@ const SimulationResultsGrid: React.FC = () => {
               key: "strategy",
               width: 140,
               sorter: (a, b) => (a.strategy ?? "").localeCompare(b.strategy ?? ""),
+              filters: strategyFilters,
+              onFilter: (value, record) => (record.strategy ?? "") === String(value),
+              filterSearch: true,
             },
             {
               title: "Ticker",
@@ -202,6 +217,9 @@ const SimulationResultsGrid: React.FC = () => {
               key: "ticker",
               width: 90,
               sorter: (a, b) => (a.ticker ?? "").localeCompare(b.ticker ?? ""),
+              filters: tickerFilters,
+              onFilter: (value, record) => (record.ticker ?? "") === String(value),
+              filterSearch: true,
             },
             {
               title: "Start Date",
@@ -209,6 +227,8 @@ const SimulationResultsGrid: React.FC = () => {
               key: "actualStartDate",
               width: 110,
               sorter: (a, b) => (a.actualStartDate ?? "").localeCompare(b.actualStartDate ?? ""),
+              filters: startDateFilters,
+              onFilter: (value, record) => (record.actualStartDate ?? "") === String(value),
               render: (value: string | null) => formatDateOnly(value),
             },
             {
@@ -217,6 +237,8 @@ const SimulationResultsGrid: React.FC = () => {
               key: "endDate",
               width: 110,
               sorter: (a, b) => (a.endDate ?? "").localeCompare(b.endDate ?? ""),
+              filters: endDateFilters,
+              onFilter: (value, record) => (record.endDate ?? "") === String(value),
               render: (value: string | null) => formatDateOnly(value),
             },
             {
@@ -288,6 +310,9 @@ const SimulationResultsGrid: React.FC = () => {
               key: "stopReason",
               width: 260,
               sorter: (a, b) => (a.stopReason ?? "").localeCompare(b.stopReason ?? ""),
+              filters: stopReasonFilters,
+              onFilter: (value, record) => (record.stopReason ?? "") === String(value),
+              filterSearch: true,
               render: (value: string | null) => (value ? <Tag color="orange">{value}</Tag> : "-"),
             },
           ]}
