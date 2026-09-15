@@ -1,6 +1,6 @@
 export interface PutCalendarSimulationResult {
   recordedAt: string;
-  strategy: "Put Calendar Spread Roll" | "3 Tier";
+  strategy: "Put Calendar Spread Roll" | "3 Tier" | "Call Calendar Spread Roll";
   ticker: string;
   requestedStartDate: string;
   actualStartDate: string;
@@ -86,3 +86,42 @@ export async function fetchPutCalendarSimulationResults(): Promise<
 
   return payload.results as PutCalendarSimulationResult[];
 }
+
+export interface PutCalendarSimulationInput {
+  strategy: PutCalendarSimulationResult["strategy"];
+  ticker: string;
+  requestedStartDate: string;
+  shortExpiryDate: string;
+  sellExpiryDate: string | null;
+  longExpiryDate: string;
+  shortStrike: number;
+  sellStrike: number | null;
+  longStrike: number;
+}
+
+const normalizeDate = (value: string | null | undefined): string =>
+  value ? value.slice(0, 10) : "";
+
+const sameNullableNumber = (left: number | null, right: number | null): boolean =>
+  left === right || (left === null && right === null);
+
+export async function findExistingPutCalendarSimulation(
+  input: PutCalendarSimulationInput
+): Promise<PutCalendarSimulationResult | null> {
+  const results = await fetchPutCalendarSimulationResults();
+  const normalizedTicker = input.ticker.trim().toUpperCase();
+
+  return results.find((result) =>
+    result.strategy === input.strategy &&
+    result.ticker.trim().toUpperCase() === normalizedTicker &&
+    normalizeDate(result.requestedStartDate) === normalizeDate(input.requestedStartDate) &&
+    normalizeDate(result.shortExpiryDate) === normalizeDate(input.shortExpiryDate) &&
+    normalizeDate(result.longExpiryDate) === normalizeDate(input.longExpiryDate) &&
+    result.shortStrike === input.shortStrike &&
+    result.longStrike === input.longStrike &&
+    normalizeDate(result.sellExpiryDate) === normalizeDate(input.sellExpiryDate) &&
+    sameNullableNumber(result.sellStrike, input.sellStrike)
+  ) ?? null;
+}
+
+export const appendCallCalendarSimulationResult = appendPutCalendarSimulationResult;

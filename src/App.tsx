@@ -34,6 +34,7 @@ const FutureChart = lazy(() => import("./components/FutureChart"));
 const ThreeTier = lazy(() => import("./components/ThreeTier"));
 const SimulationCalendar = lazy(() => import("./components/SimulationCalendar"));
 const SimulationResultsGrid = lazy(() => import("./components/SimulationResultsGrid"));
+const OptionChainChart = lazy(() => import("./components/OptionChainChart"));
 
 const PAGE_NOT_FOUND_KEY = "page-not-found";
 const VALID_TABS = new Set([
@@ -54,6 +55,7 @@ const VALID_TABS = new Set([
   "charts-and-link",
   "future-chart",
   "three-tier",
+  "option-chain-chart",
 ]);
 
 const PageNotFound: React.FC = () => (
@@ -514,6 +516,15 @@ const App: React.FC = () => {
                 children: (
                   <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
                     <ThreeTier />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "option-chain-chart",
+                label: "Option Chain Chart",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <OptionChainChart />
                   </Suspense>
                 ),
               },

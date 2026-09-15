@@ -35,6 +35,7 @@ import {
 } from "../api/backtest";
 import {
   appendPutCalendarSimulationResult,
+  findExistingPutCalendarSimulation,
   isSimulationResultsApiConfigured,
 } from "../api/simulationResults";
 import tradingDatesJson from "../assets/trading_dates_2026.json";
@@ -227,7 +228,7 @@ const fallbackTradingDates = (tradingDatesJson as string[])
   .filter((value) => dayjs(value).isValid());
 
 const tradingDates = Array.from(
-  new Set(fullTradingDatesFromSpy.length > 0 ? fullTradingDatesFromSpy : fallbackTradingDates)
+  new Set([...fallbackTradingDates, ...fullTradingDatesFromSpy])
 ).sort((a, b) => dayjs(a).valueOf() - dayjs(b).valueOf());
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -636,7 +637,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
   const fetchStockWithCache = async (symbol: string, date: string): Promise<CachedStockPrice> => {
     const cacheKey = getCacheKey(symbol, date);
     const cached = stockCacheRef.current[cacheKey];
-    if (cached) return cached;
+    if (cached && cached.closePrice !== null && Number.isFinite(cached.closePrice)) return cached;
 
     const pending = stockInFlightRef.current.get(cacheKey);
     if (pending) return pending;
@@ -1145,6 +1146,30 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
         }
         if (!dayjs(secondShortExpiryDate).isBefore(dayjs(longExpiryDate), "day")) {
           throw new Error("Second short expiry date must be before the long expiry date");
+        }
+      }
+
+      if (isSimulationResultsApiConfigured()) {
+        const existingSimulation = await findExistingPutCalendarSimulation({
+          strategy: enableSecondShortPut ? "3 Tier" : "Put Calendar Spread Roll",
+          ticker: symbol,
+          requestedStartDate: effectiveStartDate,
+          shortExpiryDate: initialShortExpiryDate,
+          sellExpiryDate: secondShortExpiryDate,
+          longExpiryDate,
+          shortStrike: openingFirstPutStrike,
+          sellStrike: enableSecondShortPut ? openingSellPutStrike : null,
+          longStrike: openingLongPutStrike,
+        });
+
+        if (existingSimulation) {
+          const recordedAt = existingSimulation.recordedAt
+            ? ` (recorded ${existingSimulation.recordedAt.slice(0, 10)})`
+            : "";
+          throw new Error(
+            `This simulation configuration already exists in Google Sheets${recordedAt}. ` +
+            "Change the start date, expiry, strike, or ticker before running it again."
+          );
         }
       }
 

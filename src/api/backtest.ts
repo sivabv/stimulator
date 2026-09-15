@@ -4,6 +4,7 @@
  */
 
 import type { BacktestRequest, BacktestResponse, PricePoint } from "../types";
+import qqqClosingData from "../assets/qqq-closing.json";
 import spyClosingData from "../assets/spy-closing.json";
 import { getSqliteItem } from "../utils/sqliteStorage";
 
@@ -23,10 +24,47 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 // Massive.com API configuration
 const MASSIVE_API_KEY = "ZMR7fChWbrDYWqvT41rU_rE28HUEkQuS";
 const MASSIVE_BASE_URL = "https://api.massive.com/v1/open-close";
+
+// Alpha Vantage API configuration
+const ALPHA_VANTAGE_API_KEY = "0MFMXNIBW0OFI75Q";
+const ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query";
+
+export interface AlphaVantageOptionContract {
+  contractID: string;
+  symbol: string;
+  expiration: string;
+  strike: string;
+  type: "call" | "put";
+  last: string;
+  mark: string;
+  bid: string;
+  bid_size: string;
+  ask: string;
+  ask_size: string;
+  volume: string;
+  open_interest: string;
+  date: string;
+  implied_volatility: string;
+  delta: string;
+  gamma: string;
+  theta: string;
+  vega: string;
+  rho: string;
+}
+
+export interface AlphaVantageHistoricalOptionsResponse {
+  endpoint: string;
+  message: string;
+  data: AlphaVantageOptionContract[];
+}
 const MASTER_STOCK_DATA_KEY = "masterStockData";
 const SPY_CLOSING_SERIES: Array<{ date: string; close: number | null }> = spyClosingData;
+const QQQ_CLOSING_SERIES: Array<{ date: string; close: number | null }> = qqqClosingData;
 const LOCAL_SPY_CLOSING_BY_DATE = new Map(
   SPY_CLOSING_SERIES.map((point) => [point.date, point.close])
+);
+const LOCAL_QQQ_CLOSING_BY_DATE = new Map(
+  QQQ_CLOSING_SERIES.map((point) => [point.date, point.close])
 );
 
 interface CachedStockResponse {
@@ -39,17 +77,10 @@ interface CachedStockResponse {
 
 type MasterStockData = Record<string, CachedStockResponse>;
 
-const isJanOrFeb = (date: string): boolean => {
-  const month = date.slice(5, 7);
-  return month === "01" || month === "02";
-};
-
-const getSpyCloseFromJanFebArray = (
-  symbol: string,
-  date: string
-): number | null | undefined => {
-  if (symbol !== "SPY" || !isJanOrFeb(date)) return undefined;
-  return LOCAL_SPY_CLOSING_BY_DATE.get(date);
+const getBundledClose = (symbol: string, date: string): number | null | undefined => {
+  if (symbol === "SPY") return LOCAL_SPY_CLOSING_BY_DATE.get(date);
+  if (symbol === "QQQ") return LOCAL_QQQ_CLOSING_BY_DATE.get(date);
+  return undefined;
 };
 
 const normalizeFlatStockCache = (parsed: Record<string, unknown>): MasterStockData => {
@@ -223,6 +254,39 @@ export async function fetchOptionOpenClose(
 }
 
 /**
+ * Fetch historical options chain data for a symbol from Alpha Vantage's
+ * HISTORICAL_OPTIONS endpoint. If `date` is omitted, Alpha Vantage returns
+ * the most recent trading day's chain.
+ */
+export async function fetchHistoricalOptions(
+  symbol: string,
+  date?: string
+): Promise<AlphaVantageHistoricalOptionsResponse> {
+  const params = new URLSearchParams({
+    function: "HISTORICAL_OPTIONS",
+    symbol,
+    apikey: ALPHA_VANTAGE_API_KEY,
+  });
+  if (date) {
+    params.set("date", date);
+  }
+
+  const res = await fetch(`${ALPHA_VANTAGE_BASE_URL}?${params}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch historical options for ${symbol} (${res.status})`);
+  }
+
+  const data = await res.json();
+  if (data?.Information || data?.["Error Message"] || data?.Note) {
+    throw new Error(
+      data.Information ?? data["Error Message"] ?? data.Note ?? "Alpha Vantage request failed"
+    );
+  }
+
+  return data as AlphaVantageHistoricalOptionsResponse;
+}
+
+/**
  * Fetch open and close price data for a stock symbol from Massive.com API.
  */
 export async function fetchStockOpenClose(
@@ -230,6 +294,17 @@ export async function fetchStockOpenClose(
   date: string
 ): Promise<OptionOpenClose> {
   const normalizedSymbol = symbol.trim().toUpperCase();
+  const bundledClose = getBundledClose(normalizedSymbol, date);
+  if (bundledClose !== undefined) {
+    return {
+      openPrice: null,
+      closePrice: bundledClose,
+      delta: null,
+      theta: null,
+      statusCode: 200,
+    };
+  }
+
   const localMasterStockData = await loadMasterStockData();
   const stockCacheKey = `${normalizedSymbol}|${date}`;
   const cachedStock = localMasterStockData?.[stockCacheKey];
@@ -241,29 +316,6 @@ export async function fetchStockOpenClose(
       delta: null,
       theta: null,
       statusCode: cachedStock.statusCode ?? 200,
-    };
-  }
-
-  const localSpyClose = LOCAL_SPY_CLOSING_BY_DATE.get(date);
-  if (normalizedSymbol === "SPY" && localSpyClose !== undefined) {
-    return {
-      openPrice: null,
-      closePrice: localSpyClose,
-      delta: null,
-      theta: null,
-      statusCode: 200,
-    };
-  }
-
-  const spyJanFebClose = getSpyCloseFromJanFebArray(normalizedSymbol, date);
-
-  if (normalizedSymbol === "SPY" && isJanOrFeb(date)) {
-    return {
-      openPrice: null,
-      closePrice: spyJanFebClose ?? null,
-      delta: null,
-      theta: null,
-      statusCode: 200,
     };
   }
 
