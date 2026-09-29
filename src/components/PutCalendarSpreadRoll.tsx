@@ -206,6 +206,7 @@ const OPTION_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const PUT_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY = "putCalendarSpreadRollAutoSavedCheckpoint";
 const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
 const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
+const DEFAULT_SHORT_EXPIRY_WEEKS = 5;
 const LONG_EXPIRY_MIN_DTE_DAYS = 15;
 const LONG_EXPIRY_MAX_DTE_DAYS = 45;
 const MIN_AUTO_ROLL_CREDIT = 0.2;
@@ -537,7 +538,7 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
       ? routeParams.firstExpiryDate
       : enableSecondShortPut
         ? initialFirstTradingDate
-        : getFridayWeeksAfter(initialFirstTradingDate, 4)
+        : getFridayWeeksAfter(initialFirstTradingDate, DEFAULT_SHORT_EXPIRY_WEEKS)
   );
   const [preferredSecondShortExpiryDate, setPreferredSecondShortExpiryDate] = useState(
     routeTargetsThisSimulator && routeParams.sellExpiryDate
@@ -1742,7 +1743,9 @@ const PutCalendarSpreadRoll: React.FC<PutCalendarSpreadRollProps> = ({
                       nextTradingDate ? (getNextTradingDate(nextTradingDate) ?? "") : ""
                     );
                   } else {
-                    setPreferredShortExpiryDate(getFridayWeeksAfter(nextStartDate, 4));
+                    setPreferredShortExpiryDate(
+                      getFridayWeeksAfter(nextStartDate, DEFAULT_SHORT_EXPIRY_WEEKS)
+                    );
                     setPreferredLongExpiryDate(getFridayWeeksAfter(nextStartDate, 8));
                   }
                 }

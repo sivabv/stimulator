@@ -25,6 +25,7 @@ const TradeLinks = lazy(() => import("./components/TradeLinks"));
 const WeeklyStraddleRoll = lazy(() => import("./components/WeeklyStraddleRoll"));
 const StraddleRolling = lazy(() => import("./components/StraddleRolling"));
 const PutCalendarSpreadRoll = lazy(() => import("./components/PutCalendarSpreadRoll"));
+const StrangleCalendar = lazy(() => import("./components/StrangleCalendar"));
 const CallCalendarSpreadRoll = lazy(() => import("./components/CallCalendarSpreadRoll"));
 const CalendarSpreadRollSplit = lazy(() => import("./components/CalendarSpreadRollSplit"));
 const LocalFullScreenCharts = lazy(() => import("./components/LocalFullScreenCharts"));
@@ -37,7 +38,9 @@ const SimulationResultsGrid = lazy(() => import("./components/SimulationResultsG
 const OptionChainChart = lazy(() => import("./components/OptionChainChart"));
 
 const PAGE_NOT_FOUND_KEY = "page-not-found";
-const VALID_TABS = new Set([
+const hostname = window.location.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+const VALID_TABS = new Set(isLocalhost ? [
   "trade-links",
   "backtest",
   "charts-and-link-v2",
@@ -47,6 +50,7 @@ const VALID_TABS = new Set([
   "weekly-straddle-roll",
   "straddle-rolling",
   "put-calendar-spread-roll",
+  "strangle-calendar",
   "simulation-calendar",
   "simulation-results",
   "call-calendar-spread-roll",
@@ -56,7 +60,7 @@ const VALID_TABS = new Set([
   "future-chart",
   "three-tier",
   "option-chain-chart",
-]);
+] : []);
 
 const PageNotFound: React.FC = () => (
   <Result
@@ -89,9 +93,7 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    if (activeTab !== PAGE_NOT_FOUND_KEY) {
-      syncTabState(activeTab);
-    }
+    syncTabState(activeTab);
   }, [activeTab]);
 
   useEffect(() => {
@@ -321,6 +323,15 @@ const App: React.FC = () => {
                 children: (
                   <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
                     <PutCalendarSpreadRoll />
+                  </Suspense>
+                ),
+              },
+              {
+                key: "strangle-calendar",
+                label: "Strangle Calendar",
+                children: (
+                  <Suspense fallback={<Spin size="large" tip="Loading tab…" />}>
+                    <StrangleCalendar />
                   </Suspense>
                 ),
               },

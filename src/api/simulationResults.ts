@@ -1,6 +1,6 @@
 export interface PutCalendarSimulationResult {
   recordedAt: string;
-  strategy: "Put Calendar Spread Roll" | "3 Tier" | "Call Calendar Spread Roll";
+  strategy: "Put Calendar Spread Roll" | "3 Tier" | "Call Calendar Spread Roll" | "Strangle Calendar";
   ticker: string;
   requestedStartDate: string;
   actualStartDate: string;

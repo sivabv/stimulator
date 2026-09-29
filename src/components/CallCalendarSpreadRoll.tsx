@@ -153,6 +153,7 @@ const MASTER_STOCK_DATA_KEY = "masterStockData";
 const OPTION_CACHE_STORAGE_KEY = "callCalendarOptionCache";
 const OPTION_CACHE_MAX_ENTRIES = 2000;
 const OPTION_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+const OPTION_PRICE_FALLBACK_WINDOW_DAYS = 5;
 const CALL_CALENDAR_AUTO_SAVED_CHECKPOINT_KEY = "callCalendarSpreadRollAutoSavedCheckpoint";
 const SHORT_EXPIRY_MIN_DTE_DAYS = 15;
 const SHORT_EXPIRY_MAX_DTE_DAYS = 75;
@@ -569,7 +570,7 @@ const CallCalendarSpreadRoll: React.FC = () => {
     }
   };
 
-  const fetchOptionWithCache = async (
+  const fetchExactOptionWithCache = async (
     symbol: string,
     expiryDate: string,
     strikePrice: number,
@@ -598,6 +599,61 @@ const CallCalendarSpreadRoll: React.FC = () => {
     } finally {
       optionInFlightRef.current.delete(cacheKey);
     }
+  };
+
+  const fetchOptionWithCache = async (
+    symbol: string,
+    expiryDate: string,
+    strikePrice: number,
+    optionType: "C" | "P",
+    date: string
+  ): Promise<OptionOpenClose> => {
+    const exactData = await fetchExactOptionWithCache(
+      symbol,
+      expiryDate,
+      strikePrice,
+      optionType,
+      date
+    );
+    if (exactData.closePrice !== null || exactData.statusCode === 429) return exactData;
+
+    const targetDate = dayjs(date);
+    const nearbyDates = tradingDates
+      .map((candidateDate) => ({
+        date: candidateDate,
+        offsetDays: dayjs(candidateDate).diff(targetDate, "day"),
+      }))
+      .filter(
+        ({ offsetDays }) =>
+          offsetDays !== 0 && Math.abs(offsetDays) <= OPTION_PRICE_FALLBACK_WINDOW_DAYS
+      )
+      .sort(
+        (left, right) =>
+          Math.abs(left.offsetDays) - Math.abs(right.offsetDays) ||
+          left.offsetDays - right.offsetDays
+      );
+
+    for (const candidate of nearbyDates) {
+      const nearbyData = await fetchExactOptionWithCache(
+        symbol,
+        expiryDate,
+        strikePrice,
+        optionType,
+        candidate.date
+      );
+      if (nearbyData.closePrice !== null) {
+        const requestedKey = getOptionCacheKey(symbol, expiryDate, strikePrice, optionType, date);
+        optionCacheRef.current[requestedKey] = {
+          data: nearbyData,
+          fetchedAt: new Date().toISOString(),
+        };
+        saveOptionCache(optionCacheRef.current);
+        return nearbyData;
+      }
+      if (nearbyData.statusCode === 429) return nearbyData;
+    }
+
+    return exactData;
   };
 
   const previewManualRoll = async (
